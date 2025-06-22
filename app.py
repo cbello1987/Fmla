@@ -101,7 +101,7 @@ def process_image_message(media_url, message_body):
         user_prompt = f"User's question: {message_body}" if message_body else "Please explain this FMLA document"
         
         response = openai.chat.completions.create(
-            model="gpt-4-vision-preview",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": FMLA_PROMPT},
                 {
