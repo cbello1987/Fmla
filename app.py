@@ -122,6 +122,10 @@ def process_image_message(media_url, message_body):
         print(f"Vision API Error: {e}")
         return "No pude analizar la imagen. Intente de nuevo. / I couldn't analyze the image. Please try again."
 
+@app.route('/', methods=['GET'])
+def home():
+    return "FMLA Amigo Bot is running! 🤖 Text +18775374013 to get started.", 200
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return "FMLA Amigo Bot is running!", 200
