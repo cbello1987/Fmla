@@ -84,6 +84,7 @@ def sms_webhook():
 
 def process_text_message(message_body):
     """Process text-only messages"""
+    print(f"=== CALLING OPENAI WITH MESSAGE: {message_body} ===")
     try:
         response = openai.chat.completions.create(
             model="gpt-4",
