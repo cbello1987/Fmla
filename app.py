@@ -44,11 +44,18 @@ Always end with asking if they have more questions and remind them this is educa
 
 @app.route('/sms', methods=['POST'])
 def sms_webhook():
+print("=== SMS WEBHOOK RECEIVED ===")
+print(f"Request form data: {request.form}")
+    
     try:
         # Get message data
         from_number = request.form.get('From')
         message_body = request.form.get('Body', '')
         num_media = int(request.form.get('NumMedia', 0))
+
+        print(f"Message: {message_body}")
+        print(f"From: {from_number}")
+        print(f"NumMedia: {num_media}")
         
         response_text = ""
         
