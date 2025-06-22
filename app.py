@@ -44,8 +44,8 @@ Always end with asking if they have more questions and remind them this is educa
 
 @app.route('/sms', methods=['POST'])
 def sms_webhook():
-print("=== SMS WEBHOOK RECEIVED ===")
-print(f"Request form data: {request.form}")
+    print("=== SMS WEBHOOK RECEIVED ===")
+    print(f"Request form data: {request.form}")
     
     try:
         # Get message data
@@ -139,4 +139,3 @@ def health_check():
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
-    
