@@ -5,3 +5,9 @@ python-dotenv
 Pillow
 requests
 
+flask
+twilio
+openai
+python-dotenv
+pillow
+requests
