@@ -104,11 +104,34 @@ Always end by asking if they need help with more receipts or have expense questi
 
 @app.route('/sms', methods=['POST'])
 def sms_webhook():
+    log_debug("🚀 SMS WEBHOOK TRIGGERED")
+    
     try:
-        # Get message data
-        from_number = request.form.get('From')
-        message_body = request.form.get('Body', '')
+        # Log all incoming data for debugging
+        log_debug("Incoming request", {
+            'method': request.method,
+            'content_type': request.content_type,
+            'form_keys': list(request.form.keys())
+        })
+        
+        # Get message data with validation
+        from_number = request.form.get('From', 'UNKNOWN')
+        message_body = request.form.get('Body', '').strip()
         num_media = int(request.form.get('NumMedia', 0))
+
+        log_debug("Message details", {
+            'from': from_number,
+            'body': message_body[:50] + '...' if len(message_body) > 50 else message_body,
+            'media_count': num_media
+        })
+        
+        # Basic input validation
+        if len(message_body) > 5000:  # Prevent abuse
+            return create_error_response("Message too long. Please keep it under 5000 characters.")
+        
+        # Environment check
+        if not env_ok:
+            return create_error_response("⚠️ Configuration error. Please contact support.")
         
         response_text = ""
         
@@ -129,7 +152,7 @@ def sms_webhook():
                 log_debug("❌ Non-image media received", {'type': media_content_type})
         else:
             log_debug("💬 Processing text message")
-            response_text = process_expense_message(message_body)
+            response_text = process_text_message(message_body)
         
         log_debug("✅ Response generated", {
             'length': len(response_text),
@@ -167,9 +190,17 @@ def create_error_response(message):
     log_debug(f"⚠️ Error response: {message}")
     return create_twiml_response(message)
 
-def process_text_message(message_body):
-    """Process text-only messages"""
+def process_expense_message(message_body):
+    """Process text-only expense messages with detailed error handling"""
+    log_debug("🤖 Starting OpenAI text processing", {'message_length': len(message_body)})
+    
     try:
+        # Validate OpenAI key
+        if not openai.api_key:
+            log_debug("❌ OpenAI API key missing")
+            return "Configuration error. Please contact support."
+        
+        log_debug("📡 Calling OpenAI API")
         response = openai.chat.completions.create(
             model="gpt-4",
             messages=[
@@ -295,4 +326,3 @@ def debug_info():
 if __name__ == '__main__':
     log_debug("🚀 S.V.E.N. starting up")
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
-    
