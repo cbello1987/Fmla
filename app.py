@@ -152,7 +152,7 @@ def sms_webhook():
                 log_debug("❌ Non-image media received", {'type': media_content_type})
         else:
             log_debug("💬 Processing text message")
-            response_text = process_text_message(message_body)
+            response_text = process_expense_message(message_body)
         
         log_debug("✅ Response generated", {
             'length': len(response_text),
