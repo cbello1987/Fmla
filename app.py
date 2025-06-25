@@ -91,14 +91,27 @@ CORE CAPABILITIES:
    - Remind about receipt requirements
    - Help with itemization (separate business from personal)
 
-4. CONVERSATION PATTERNS:
+4. HOTEL RECEIPT ANALYSIS (SPECIAL FORMAT):
+   When analyzing hotel receipts, always itemize as:
+   - Number of days stayed
+   - Daily room rate (before taxes)
+   - Daily taxes (sum of all taxes: state, city, occupancy, etc.)
+   - Total reimbursable vs non-reimbursable breakdown
+
+5. CONVERSATION PATTERNS:
    - Photo → "Business dinner detected! 🍽 Total: $X, Y people. Who joined you?"
    - Follow-up → Context building and proper categorization
    - Guidance → Real-time policy checking and suggestions
 
 SAMPLE RESPONSES:
-- Receipt photo: "Hotel receipt analyzed! 📊 REIMBURSABLE: Room $189 ✅ NON-REIMBURSABLE: Minibar $12.50 ❌"
-- Greeting: "Hello! I'm S.V.E.N., your Smart Virtual Expense Navigator. Send me receipt photos and I'll help categorize them instantly! 🧾✨"
+- Receipt photo: "Business dinner detected! 🍽 Total: $X, Y people. Who joined you?"
+- Hotel receipt: "Hotel stay analyzed! 🏨 
+  📊 BREAKDOWN: 3 nights × $189/night = $567
+  💰 Daily taxes: $23.67/night (state + city + occupancy)
+  ✅ REIMBURSABLE: $635.01 total
+  ❌ NON-REIMBURSABLE: Minibar $12.50, Resort fee $35"
+- First interaction: "I'm S.V.E.N., your Smart Virtual Expense Navigator. Send me receipt photos and I'll help categorize them instantly! 🧾✨"
+- Follow-up: "Need help with more receipts or have expense questions?"
 
 Always end by asking if they need help with more receipts or have expense questions. This is an educational demo only."""
 
@@ -200,15 +213,16 @@ def process_expense_message(message_body):
             log_debug("❌ OpenAI API key missing")
             return "Configuration error. Please contact support."
         
-        log_debug("📡 Calling OpenAI API")
+        log_debug("📡 Calling OpenAI API with timeout")
         response = openai.chat.completions.create(
             model="gpt-4",
             messages=[
                 {"role": "system", "content": SVEN_PROMPT},
                 {"role": "user", "content": message_body}
             ],
-            max_tokens=1000,
-            temperature=0.7
+            max_tokens=800,  # Reduced for faster responses
+            temperature=0.7,
+            timeout=15  # 15 second timeout
         )
         
         result = response.choices[0].message.content
@@ -236,7 +250,7 @@ def process_expense_message(message_body):
         return "Sorry, I couldn't process your message. Please try again! 🔄"
 
 def process_receipt_image(media_url, message_body):
-    """Process receipt images with comprehensive error handling"""
+    """Process receipt images with Twilio auth and zero persistence"""
     log_debug("📸 Starting image processing", {
         'has_url': bool(media_url),
         'message_length': len(message_body) if message_body else 0
@@ -252,11 +266,37 @@ def process_receipt_image(media_url, message_body):
             log_debug("❌ OpenAI API key missing")
             return "Configuration error. Please contact support."
         
+        # Download image from Twilio with authentication
+        log_debug("📥 Downloading image from Twilio")
+        twilio_sid = os.getenv('TWILIO_ACCOUNT_SID')
+        twilio_token = os.getenv('TWILIO_AUTH_TOKEN')
+        
+        if not twilio_sid or not twilio_token:
+            log_debug("❌ Twilio credentials missing")
+            return "Configuration error. Please contact support."
+        
+        # Download image with Twilio auth (with timeout for performance)
+        response = requests.get(media_url, auth=(twilio_sid, twilio_token), timeout=10)
+        
+        if response.status_code != 200:
+            log_debug("❌ Failed to download image", {'status': response.status_code})
+            return "Could not access image. Please try again! 📸"
+        
+        # Check image size (prevent huge uploads from slowing us down)
+        image_size_mb = len(response.content) / (1024 * 1024)
+        if image_size_mb > 10:  # 10MB limit
+            log_debug("❌ Image too large", {'size_mb': image_size_mb})
+            return "Image too large. Please send a smaller receipt photo! 📸"
+        
+        # Convert to base64 for OpenAI (zero persistence - memory only)
+        image_data = base64.b64encode(response.content).decode('utf-8')
+        log_debug("✅ Image downloaded and converted", {'size_kb': len(response.content) // 1024})
+        
         # Create the prompt for receipt analysis
         user_prompt = f"User's question: {message_body}" if message_body else "Please analyze this receipt for expense categorization"
         
-        log_debug("📡 Calling OpenAI Vision API")
-        response = openai.chat.completions.create(
+        log_debug("📡 Calling OpenAI Vision API with base64 image")
+        openai_response = openai.chat.completions.create(
             model="gpt-4o",
             messages=[
                 {"role": "system", "content": SVEN_PROMPT},
@@ -264,22 +304,27 @@ def process_receipt_image(media_url, message_body):
                     "role": "user", 
                     "content": [
                         {"type": "text", "text": user_prompt},
-                        {"type": "image_url", "image_url": {"url": media_url}}
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
                     ]
                 }
             ],
-            max_tokens=1200,
-            temperature=0.7
+            max_tokens=1000,  # Reduced for faster responses
+            temperature=0.7,
+            timeout=20  # 20 second timeout for vision
         )
         
-        result = response.choices[0].message.content
+        result = openai_response.choices[0].message.content
         log_debug("✅ Vision API response received", {
             'response_length': len(result),
-            'tokens_used': response.usage.total_tokens if hasattr(response, 'usage') else 'unknown'
+            'tokens_used': openai_response.usage.total_tokens if hasattr(openai_response, 'usage') else 'unknown'
         })
         
+        # Image data automatically discarded when function ends - zero persistence!
         return result
         
+    except requests.RequestException as e:
+        log_debug("❌ Image download failed", {'error': str(e)})
+        return "Could not download image. Please try again! 📸"
     except openai.AuthenticationError as e:
         log_debug("❌ OpenAI Authentication Error", {'error': str(e)})
         return "API authentication error. Please contact support."
@@ -291,8 +336,8 @@ def process_receipt_image(media_url, message_body):
         return "AI service error. Please try again! 🔄"
     except Exception as e:
         log_debug("💥 Unexpected error in image processing", {
-            'error': str(e),
-            'traceback': traceback.format_exc()
+            'error': str(e)[:200],
+            'type': type(e).__name__
         })
         return "I couldn't analyze the receipt image. Please try again! 📸"
 
