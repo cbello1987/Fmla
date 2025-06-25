@@ -207,6 +207,10 @@ def process_expense_message(message_body):
     """Process text-only expense messages with detailed error handling"""
     log_debug("🤖 Starting OpenAI text processing", {'message_length': len(message_body)})
     
+    # BUTTON TEST - Remove after testing
+    if message_body.lower().strip() == "test buttons":
+        return test_interactive_buttons()
+    
     try:
         # Validate OpenAI key
         if not openai.api_key:
@@ -367,6 +371,58 @@ def debug_info():
     }
     
     return debug_data, 200
+
+def test_interactive_buttons():
+    """Test WhatsApp interactive button capabilities"""
+    log_debug("🧪 Testing interactive buttons")
+    
+    # Try WhatsApp Interactive Message format
+    try:
+        from twilio.rest import Client
+        client = Client(os.getenv('TWILIO_ACCOUNT_SID'), os.getenv('TWILIO_AUTH_TOKEN'))
+        
+        # Test interactive message with buttons
+        interactive_message = {
+            "type": "interactive",
+            "interactive": {
+                "type": "button",
+                "body": {
+                    "text": "🧪 Button Test!\n\nWhich expense type?"
+                },
+                "action": {
+                    "buttons": [
+                        {
+                            "type": "reply",
+                            "reply": {
+                                "id": "meal_btn",
+                                "title": "🍽️ Meal"
+                            }
+                        },
+                        {
+                            "type": "reply", 
+                            "reply": {
+                                "id": "travel_btn",
+                                "title": "✈️ Travel"
+                            }
+                        },
+                        {
+                            "type": "reply",
+                            "reply": {
+                                "id": "other_btn", 
+                                "title": "📋 Other"
+                            }
+                        }
+                    ]
+                }
+            }
+        }
+        
+        log_debug("✅ Interactive buttons supported!")
+        return "🧪 Testing interactive buttons... Check if you see clickable buttons above!"
+        
+    except Exception as e:
+        log_debug("❌ Interactive buttons not supported", {'error': str(e)})
+        return f"❌ Buttons not supported in sandbox.\n\nFallback menu:\n1️⃣ Meal\n2️⃣ Travel\n3️⃣ Other\n\nReply with 1, 2, or 3"
 
 if __name__ == '__main__':
     log_debug("🚀 S.V.E.N. starting up")
