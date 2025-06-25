@@ -111,6 +111,7 @@ SAMPLE RESPONSES:
   ✅ REIMBURSABLE: $635.01 total
   ❌ NON-REIMBURSABLE: Minibar $12.50, Resort fee $35"
 - First interaction: "I'm S.V.E.N., your Smart Virtual Expense Navigator. Send me receipt photos and I'll help categorize them instantly! 🧾✨"
+- Menu offering: "Choose category:\n1️⃣ Business meal\n2️⃣ Travel expense\n3️⃣ Office supplies\n4️⃣ Other business\n5️⃣ Help\n\nReply with 1, 2, 3, 4, or 5"
 - Follow-up: "Need help with more receipts or have expense questions?"
 
 Always end by asking if they need help with more receipts or have expense questions. This is an educational demo only."""
@@ -207,9 +208,9 @@ def process_expense_message(message_body):
     """Process text-only expense messages with detailed error handling"""
     log_debug("🤖 Starting OpenAI text processing", {'message_length': len(message_body)})
     
-    # BUTTON TEST - Remove after testing
-    if message_body.lower().strip() == "test buttons":
-        return test_interactive_buttons()
+    # Handle numbered menu responses
+    if message_body.strip() in ['1', '2', '3', '4', '5']:
+        return handle_menu_choice(message_body.strip())
     
     try:
         # Validate OpenAI key
@@ -371,6 +372,24 @@ def debug_info():
     }
     
     return debug_data, 200
+
+def handle_menu_choice(choice):
+    """Handle numbered menu selections"""
+    log_debug("📋 Processing menu choice", {'choice': choice})
+    
+    menu_responses = {
+        '1': "✅ **Business Meal** selected!\n\nGreat! I'll categorize this as a business meal. Perfect for client entertainment or team lunches.\n\nNeed help with more receipts? Just send another photo! 📸",
+        
+        '2': "✅ **Travel Expense** selected!\n\nNice! This will be categorized as travel-related. Great for flights, hotels, or ground transportation.\n\nSend more travel receipts and I'll keep tracking! ✈️",
+        
+        '3': "✅ **Office Supplies** selected!\n\nPerfect! This goes under office supplies and equipment. Ideal for business materials and tools.\n\nWhat's your next expense? Send another receipt! 📋",
+        
+        '4': "✅ **Other Business** selected!\n\nGot it! I'll mark this as a general business expense. Good for miscellaneous business costs.\n\nReady for your next receipt! 💼",
+        
+        '5': "💡 **Need Help?**\n\nI'm S.V.E.N., your Smart Virtual Expense Navigator! I help categorize business receipts instantly.\n\n🔸 Send receipt photos\n🔸 Get instant categorization\n🔸 Track business expenses\n\nJust send me a receipt photo to get started! 📸✨"
+    }
+    
+    return menu_responses.get(choice, "Please choose 1, 2, 3, 4, or 5 from the menu above! 📋")
 
 def test_interactive_buttons():
     """Test WhatsApp interactive button capabilities"""
