@@ -190,9 +190,12 @@ def sms_webhook():
         log_structured('INFO', 'Processing message', correlation_id, 
                       from_user=from_number[-4:], media_count=num_media)
         
-        # Environment check
+        # Environment check with graceful degradation
         if not env_ok:
-            return create_error_response("Configuration error", correlation_id)
+            return create_error_response(
+                "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄", 
+                correlation_id
+            )
         
         response_text = ""
         
@@ -359,10 +362,33 @@ def handle_menu_choice(choice, correlation_id):
 def home():
     return "S.V.E.N. (Smart Virtual Expense Navigator) is running! 🤖 Text +18775374013 to start managing expenses!", 200
 
+@app.route('/ping', methods=['GET'])
+def ping():
+    """Simple keep-alive endpoint"""
+    return {'status': 'alive', 'timestamp': datetime.now().isoformat()}, 200
+
 @app.route('/health', methods=['GET'])
 def health_check():
-    env_status = "✅ Environment OK" if env_ok else "❌ Environment Issues"
-    return f"S.V.E.N. is running efficiently! ⚡ {env_status}", 200
+    """Comprehensive health check"""
+    health_data = {
+        'status': 'healthy',
+        'timestamp': datetime.now().isoformat(),
+        'environment_ok': env_ok,
+        'cache_size': len(response_cache),
+        'memory_usage': f"{len(str(response_cache)) / 1024:.1f}KB"
+    }
+    
+    # Test OpenAI connectivity
+    try:
+        if not openai.api_key:
+            health_data['openai_status'] = 'no_key'
+        else:
+            health_data['openai_status'] = 'ready'
+    except:
+        health_data['openai_status'] = 'error'
+    
+    status_code = 200 if env_ok else 503
+    return health_data, status_code
 
 @app.route('/debug', methods=['GET'])
 def debug_info():
