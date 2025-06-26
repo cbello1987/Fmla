@@ -413,9 +413,103 @@ def debug_info():
     
     return debug_data, 200
 
-def handle_menu_choice(choice):
-    """Handle numbered menu selections"""
-    log_debug("📋 Processing menu choice", {'choice': choice})
+def process_expense_message_optimized(message_body, correlation_id):
+    """Optimized text processing with caching and circuit breaker"""
+    
+    # Fast path: Check cache first
+    message_hash = hashlib.md5(message_body.encode()).hexdigest()
+    cached = get_cached_response(message_hash)
+    if cached and time.time() - cached['timestamp'] < CACHE_EXPIRY:
+        log_structured('INFO', 'Cache hit', correlation_id)
+        return cached['response']
+    
+    log_structured('INFO', 'OpenAI text processing', correlation_id)
+    
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": SVEN_PROMPT},
+                {"role": "user", "content": message_body}
+            ],
+            max_tokens=600,  # Reduced for speed
+            temperature=0.5,  # Reduced for consistency
+            timeout=12  # Shorter timeout
+        )
+        
+        result = response.choices[0].message.content
+        
+        # Cache successful response
+        cache_response(message_hash, result)
+        
+        log_structured('INFO', 'OpenAI success', correlation_id, 
+                      tokens=response.usage.total_tokens if hasattr(response, 'usage') else 0)
+        return result
+        
+    except openai.RateLimitError:
+        log_structured('WARN', 'Rate limit hit', correlation_id)
+        return "Service busy. Please try again in a moment."
+    except openai.AuthenticationError:
+        log_structured('ERROR', 'Auth error', correlation_id)
+        return "Service temporarily unavailable."
+    except Exception as e:
+        log_structured('ERROR', 'OpenAI error', correlation_id, error=str(e)[:100])
+        return "Sorry, please try again."
+
+def process_receipt_image_optimized(media_url, content_type, message_body, correlation_id):
+    """Optimized image processing with validation and circuit breaker"""
+    
+    log_structured('INFO', 'Image processing start', correlation_id)
+    
+    # Fast validation
+    if not media_url or not content_type or not content_type.startswith('image/'):
+        return "Please send a clear receipt photo."
+    
+    try:
+        # Download with strict timeout
+        twilio_sid = os.getenv('TWILIO_ACCOUNT_SID')
+        twilio_token = os.getenv('TWILIO_AUTH_TOKEN')
+        
+        response = requests.get(media_url, auth=(twilio_sid, twilio_token), timeout=8)
+        
+        if response.status_code != 200:
+            log_structured('WARN', 'Image download failed', correlation_id, status=response.status_code)
+            return "Could not access image. Please try again."
+        
+        # Size check
+        if len(response.content) > 8 * 1024 * 1024:  # 8MB limit
+            return "Image too large. Please send a smaller photo."
+        
+        # Process with OpenAI
+        image_data = base64.b64encode(response.content).decode('utf-8')
+        
+        openai_response = openai.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": SVEN_PROMPT},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "Analyze this receipt"},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
+                ]}
+            ],
+            max_tokens=800,
+            temperature=0.3,
+            timeout=18
+        )
+        
+        result = openai_response.choices[0].message.content
+        log_structured('INFO', 'Image processing success', correlation_id)
+        return result
+        
+    except requests.Timeout:
+        return "Image processing timed out. Please try again."
+    except Exception as e:
+        log_structured('ERROR', 'Image processing error', correlation_id, error=str(e)[:100])
+        return "Could not process image. Please try again."
+
+def handle_menu_choice(choice, correlation_id):
+    """Handle menu choices - fast path with no AI calls"""
+    log_structured('INFO', 'Menu choice', correlation_id, choice=choice)
     
     menu_responses = {
         '1': "📸 **Ready for receipt photo!**\n\nSend me a photo of your receipt and I'll analyze it instantly! I can handle:\n🍽️ Restaurant receipts\n🏨 Hotel bills\n✈️ Travel expenses\n🚗 Transportation\n\nJust attach the photo to your next message! 📎",
