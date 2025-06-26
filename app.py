@@ -9,7 +9,6 @@ from PIL import Image
 import io
 import traceback
 from datetime import datetime
-
 import hashlib
 import hmac
 import uuid
@@ -22,7 +21,7 @@ load_dotenv()
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB limit
 
-# Configure OpenAI with connection pooling
+# Configure OpenAI
 openai.api_key = os.getenv('OPENAI_API_KEY')
 
 # Performance monitoring
@@ -40,10 +39,6 @@ def verify_webhook_signature(request):
     """Verify Twilio webhook signature for security"""
     if os.getenv('FLASK_ENV') == 'development':
         return True  # Skip in dev
-    
-    # In production, verify Twilio signature
-    # signature = request.headers.get('X-Twilio-Signature', '')
-    # return hmac.compare_digest(signature, expected_signature)
     return True
 
 @lru_cache(maxsize=100)
@@ -86,7 +81,6 @@ def sanitize_input(text, max_length=5000):
         return ""
     if len(text) > max_length:
         raise ValueError(f"Input too long: {len(text)} chars (max {max_length})")
-    # Remove potentially dangerous characters
     return text.strip()[:max_length]
 
 # Environment check on startup
@@ -95,10 +89,10 @@ def check_environment():
     missing = [var for var in required_vars if not os.getenv(var)]
     
     if missing:
-        log_debug(f"❌ MISSING ENVIRONMENT VARIABLES: {missing}")
+        log_structured('ERROR', f"Missing env vars: {missing}")
         return False
     else:
-        log_debug("✅ All environment variables loaded")
+        log_structured('INFO', "All environment variables loaded")
         return True
 
 # Check environment on startup
@@ -142,10 +136,16 @@ CORE CAPABILITIES:
    - Daily taxes (sum of all taxes: state, city, occupancy, etc.)
    - Total reimbursable vs non-reimbursable breakdown
 
-5. CONVERSATION PATTERNS:
-   - Photo → "Business dinner detected! 🍽 Total: $X, Y people. Who joined you?"
-   - Follow-up → Context building and proper categorization
-   - Guidance → Real-time policy checking and suggestions
+5. MENU INTERACTION SYSTEM:
+   When users need to categorize expenses or make choices, ALWAYS offer a numbered menu:
+   "Choose category:
+   1️⃣ Business meal
+   2️⃣ Travel expense  
+   3️⃣ Office supplies
+   4️⃣ Other business
+   5️⃣ Help
+   
+   Reply with 1, 2, 3, 4, or 5"
 
 SAMPLE RESPONSES:
 - Receipt photo: "Business dinner detected! 🍽 Total: $X, Y people. Who joined you?"
@@ -164,7 +164,6 @@ Choose what you'd like to do:
 5️⃣ Ask a question
 
 Reply with 1, 2, 3, 4, or 5"
-- Menu offering: "Choose category:\n1️⃣ Business meal\n2️⃣ Travel expense\n3️⃣ Office supplies\n4️⃣ Other business\n5️⃣ Help\n\nReply with 1, 2, 3, 4, or 5"
 - Follow-up: "Need help with more receipts or have expense questions?"
 
 Always end by asking if they need help with more receipts or have expense questions. This is an educational demo only."""
@@ -243,175 +242,6 @@ def create_error_response(message, correlation_id):
     """Create standardized error response"""
     log_structured('WARN', 'Error response', correlation_id, message=message)
     return create_twiml_response(message, correlation_id)
-
-def process_expense_message(message_body):
-    """Process text-only expense messages with detailed error handling"""
-    log_debug("🤖 Starting OpenAI text processing", {'message_length': len(message_body)})
-    
-    # Handle numbered menu responses
-    if message_body.strip() in ['1', '2', '3', '4', '5']:
-        return handle_menu_choice(message_body.strip())
-    
-    try:
-        # Validate OpenAI key
-        if not openai.api_key:
-            log_debug("❌ OpenAI API key missing")
-            return "Configuration error. Please contact support."
-        
-        log_debug("📡 Calling OpenAI API with timeout")
-        response = openai.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "system", "content": SVEN_PROMPT},
-                {"role": "user", "content": message_body}
-            ],
-            max_tokens=800,  # Reduced for faster responses
-            temperature=0.7,
-            timeout=15  # 15 second timeout
-        )
-        
-        result = response.choices[0].message.content
-        log_debug("✅ OpenAI response received", {
-            'response_length': len(result),
-            'tokens_used': response.usage.total_tokens if hasattr(response, 'usage') else 'unknown'
-        })
-        
-        return result
-        
-    except openai.AuthenticationError as e:
-        log_debug("❌ OpenAI Authentication Error", {'error': str(e)})
-        return "API authentication error. Please contact support."
-    except openai.RateLimitError as e:
-        log_debug("❌ OpenAI Rate Limit Error", {'error': str(e)})
-        return "Service temporarily busy. Please try again in a moment! ⏳"
-    except openai.APIError as e:
-        log_debug("❌ OpenAI API Error", {'error': str(e)})
-        return "AI service error. Please try again! 🔄"
-    except Exception as e:
-        log_debug("💥 Unexpected error in text processing", {
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        })
-        return "Sorry, I couldn't process your message. Please try again! 🔄"
-
-def process_receipt_image(media_url, message_body):
-    """Process receipt images with Twilio auth and zero persistence"""
-    log_debug("📸 Starting image processing", {
-        'has_url': bool(media_url),
-        'message_length': len(message_body) if message_body else 0
-    })
-    
-    try:
-        # Validate inputs
-        if not media_url:
-            log_debug("❌ No media URL provided")
-            return "No image received. Please send a receipt photo! 📸"
-        
-        if not openai.api_key:
-            log_debug("❌ OpenAI API key missing")
-            return "Configuration error. Please contact support."
-        
-        # Download image from Twilio with authentication
-        log_debug("📥 Downloading image from Twilio")
-        twilio_sid = os.getenv('TWILIO_ACCOUNT_SID')
-        twilio_token = os.getenv('TWILIO_AUTH_TOKEN')
-        
-        if not twilio_sid or not twilio_token:
-            log_debug("❌ Twilio credentials missing")
-            return "Configuration error. Please contact support."
-        
-        # Download image with Twilio auth (with timeout for performance)
-        response = requests.get(media_url, auth=(twilio_sid, twilio_token), timeout=10)
-        
-        if response.status_code != 200:
-            log_debug("❌ Failed to download image", {'status': response.status_code})
-            return "Could not access image. Please try again! 📸"
-        
-        # Check image size (prevent huge uploads from slowing us down)
-        image_size_mb = len(response.content) / (1024 * 1024)
-        if image_size_mb > 10:  # 10MB limit
-            log_debug("❌ Image too large", {'size_mb': image_size_mb})
-            return "Image too large. Please send a smaller receipt photo! 📸"
-        
-        # Convert to base64 for OpenAI (zero persistence - memory only)
-        image_data = base64.b64encode(response.content).decode('utf-8')
-        log_debug("✅ Image downloaded and converted", {'size_kb': len(response.content) // 1024})
-        
-        # Create the prompt for receipt analysis
-        user_prompt = f"User's question: {message_body}" if message_body else "Please analyze this receipt for expense categorization"
-        
-        log_debug("📡 Calling OpenAI Vision API with base64 image")
-        openai_response = openai.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": SVEN_PROMPT},
-                {
-                    "role": "user", 
-                    "content": [
-                        {"type": "text", "text": user_prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
-                    ]
-                }
-            ],
-            max_tokens=1000,  # Reduced for faster responses
-            temperature=0.7,
-            timeout=20  # 20 second timeout for vision
-        )
-        
-        result = openai_response.choices[0].message.content
-        log_debug("✅ Vision API response received", {
-            'response_length': len(result),
-            'tokens_used': openai_response.usage.total_tokens if hasattr(openai_response, 'usage') else 'unknown'
-        })
-        
-        # Image data automatically discarded when function ends - zero persistence!
-        return result
-        
-    except requests.RequestException as e:
-        log_debug("❌ Image download failed", {'error': str(e)})
-        return "Could not download image. Please try again! 📸"
-    except openai.AuthenticationError as e:
-        log_debug("❌ OpenAI Authentication Error", {'error': str(e)})
-        return "API authentication error. Please contact support."
-    except openai.RateLimitError as e:
-        log_debug("❌ OpenAI Rate Limit Error", {'error': str(e)})
-        return "Service temporarily busy. Please try again in a moment! ⏳"
-    except openai.APIError as e:
-        log_debug("❌ OpenAI API Error", {'error': str(e)})
-        return "AI service error. Please try again! 🔄"
-    except Exception as e:
-        log_debug("💥 Unexpected error in image processing", {
-            'error': str(e)[:200],
-            'type': type(e).__name__
-        })
-        return "I couldn't analyze the receipt image. Please try again! 📸"
-
-@app.route('/', methods=['GET'])
-def home():
-    return "S.V.E.N. (Smart Virtual Expense Navigator) is running! 🤖 Text +18775374013 to start managing expenses!", 200
-
-@app.route('/health', methods=['GET'])
-def health_check():
-    env_status = "✅ Environment OK" if env_ok else "❌ Environment Issues"
-    return f"S.V.E.N. is running efficiently! ⚡ {env_status}", 200
-
-@app.route('/debug', methods=['GET'])
-def debug_info():
-    """Debug endpoint - RESTRICT IN PRODUCTION"""
-    # Check if this is development environment
-    if os.getenv('FLASK_ENV') != 'development':
-        return "Debug endpoint disabled in production", 404
-    
-    debug_data = {
-        'timestamp': datetime.now().isoformat(),
-        'environment_ok': env_ok,
-        'openai_key_present': bool(os.getenv('OPENAI_API_KEY')),
-        'twilio_sid_present': bool(os.getenv('TWILIO_ACCOUNT_SID')),
-        'flask_app': 'S.V.E.N. v1.0'
-        # Removed sensitive system info
-    }
-    
-    return debug_data, 200
 
 def process_expense_message_optimized(message_body, correlation_id):
     """Optimized text processing with caching and circuit breaker"""
@@ -525,58 +355,31 @@ def handle_menu_choice(choice, correlation_id):
     
     return menu_responses.get(choice, "Please choose 1, 2, 3, 4, or 5 from the menu above! 📋")
 
-def test_interactive_buttons():
-    """Test WhatsApp interactive button capabilities"""
-    log_debug("🧪 Testing interactive buttons")
+@app.route('/', methods=['GET'])
+def home():
+    return "S.V.E.N. (Smart Virtual Expense Navigator) is running! 🤖 Text +18775374013 to start managing expenses!", 200
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    env_status = "✅ Environment OK" if env_ok else "❌ Environment Issues"
+    return f"S.V.E.N. is running efficiently! ⚡ {env_status}", 200
+
+@app.route('/debug', methods=['GET'])
+def debug_info():
+    """Debug endpoint - RESTRICT IN PRODUCTION"""
+    if os.getenv('FLASK_ENV') != 'development':
+        return "Debug endpoint disabled in production", 404
     
-    # Try WhatsApp Interactive Message format
-    try:
-        from twilio.rest import Client
-        client = Client(os.getenv('TWILIO_ACCOUNT_SID'), os.getenv('TWILIO_AUTH_TOKEN'))
-        
-        # Test interactive message with buttons
-        interactive_message = {
-            "type": "interactive",
-            "interactive": {
-                "type": "button",
-                "body": {
-                    "text": "🧪 Button Test!\n\nWhich expense type?"
-                },
-                "action": {
-                    "buttons": [
-                        {
-                            "type": "reply",
-                            "reply": {
-                                "id": "meal_btn",
-                                "title": "🍽️ Meal"
-                            }
-                        },
-                        {
-                            "type": "reply", 
-                            "reply": {
-                                "id": "travel_btn",
-                                "title": "✈️ Travel"
-                            }
-                        },
-                        {
-                            "type": "reply",
-                            "reply": {
-                                "id": "other_btn", 
-                                "title": "📋 Other"
-                            }
-                        }
-                    ]
-                }
-            }
-        }
-        
-        log_debug("✅ Interactive buttons supported!")
-        return "🧪 Testing interactive buttons... Check if you see clickable buttons above!"
-        
-    except Exception as e:
-        log_debug("❌ Interactive buttons not supported", {'error': str(e)})
-        return f"❌ Buttons not supported in sandbox.\n\nFallback menu:\n1️⃣ Meal\n2️⃣ Travel\n3️⃣ Other\n\nReply with 1, 2, or 3"
+    debug_data = {
+        'timestamp': datetime.now().isoformat(),
+        'environment_ok': env_ok,
+        'openai_key_present': bool(os.getenv('OPENAI_API_KEY')),
+        'twilio_sid_present': bool(os.getenv('TWILIO_ACCOUNT_SID')),
+        'flask_app': 'S.V.E.N. v2.0'
+    }
+    
+    return debug_data, 200
 
 if __name__ == '__main__':
-    log_debug("🚀 S.V.E.N. starting up")
+    log_structured('INFO', "S.V.E.N. starting up")
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
