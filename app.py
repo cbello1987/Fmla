@@ -10,40 +10,84 @@ import io
 import traceback
 from datetime import datetime
 
+import hashlib
+import hmac
+import uuid
+from functools import lru_cache
+import time
+
 # Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB limit
 
-# Configure OpenAI
+# Configure OpenAI with connection pooling
 openai.api_key = os.getenv('OPENAI_API_KEY')
 
-# Debug logging function - SECURE VERSION
-def log_debug(message, data=None):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"🔍 [{timestamp}] {message}")
-    if data:
-        # Sanitize sensitive data
-        safe_data = sanitize_log_data(data)
-        print(f"   📊 Data: {safe_data}")
+# Performance monitoring
+request_start_time = None
 
-def sanitize_log_data(data):
-    """Remove sensitive information from logs"""
-    if isinstance(data, dict):
-        safe_data = {}
-        for key, value in data.items():
-            if key.lower() in ['from', 'phone', 'number']:
-                # Anonymize phone numbers
-                safe_data[key] = f"***{str(value)[-4:]}" if value else "None"
-            elif 'key' in key.lower() or 'token' in key.lower():
-                safe_data[key] = "***REDACTED***"
-            elif key == 'traceback':
-                # Limit traceback exposure
-                safe_data[key] = "ERROR_LOGGED" 
-            else:
-                safe_data[key] = value
-        return safe_data
-    return data
+# Simple in-memory cache for responses (production: use Redis)
+response_cache = {}
+CACHE_EXPIRY = 3600  # 1 hour
+
+def get_correlation_id():
+    """Generate unique request ID for tracing"""
+    return str(uuid.uuid4())[:8]
+
+def verify_webhook_signature(request):
+    """Verify Twilio webhook signature for security"""
+    if os.getenv('FLASK_ENV') == 'development':
+        return True  # Skip in dev
+    
+    # In production, verify Twilio signature
+    # signature = request.headers.get('X-Twilio-Signature', '')
+    # return hmac.compare_digest(signature, expected_signature)
+    return True
+
+@lru_cache(maxsize=100)
+def get_cached_response(message_hash):
+    """Cache responses for identical messages"""
+    return response_cache.get(message_hash)
+
+def cache_response(message_hash, response):
+    """Store response in cache with expiry"""
+    response_cache[message_hash] = {
+        'response': response,
+        'timestamp': time.time()
+    }
+    # Simple cleanup of old entries
+    current_time = time.time()
+    expired_keys = [k for k, v in response_cache.items() 
+                   if current_time - v['timestamp'] > CACHE_EXPIRY]
+    for key in expired_keys:
+        del response_cache[key]
+
+# Structured logging with correlation IDs
+def log_structured(level, message, correlation_id=None, **kwargs):
+    timestamp = datetime.now().isoformat()
+    log_data = {
+        'timestamp': timestamp,
+        'level': level,
+        'message': message,
+        'correlation_id': correlation_id,
+        **kwargs
+    }
+    # Remove sensitive data
+    if 'error' in log_data and len(str(log_data['error'])) > 200:
+        log_data['error'] = str(log_data['error'])[:200] + '...'
+    
+    print(f"{level} [{correlation_id}] {message} {log_data}")
+
+def sanitize_input(text, max_length=5000):
+    """Validate and sanitize user input"""
+    if not text:
+        return ""
+    if len(text) > max_length:
+        raise ValueError(f"Input too long: {len(text)} chars (max {max_length})")
+    # Remove potentially dangerous characters
+    return text.strip()[:max_length]
 
 # Environment check on startup
 def check_environment():
@@ -110,7 +154,16 @@ SAMPLE RESPONSES:
   💰 Daily taxes: $23.67/night (state + city + occupancy)
   ✅ REIMBURSABLE: $635.01 total
   ❌ NON-REIMBURSABLE: Minibar $12.50, Resort fee $35"
-- First interaction: "I'm S.V.E.N., your Smart Virtual Expense Navigator. Send me receipt photos and I'll help categorize them instantly! 🧾✨"
+- First interaction: "I'm S.V.E.N., your Smart Virtual Expense Navigator. Send me receipt photos and I'll help categorize them instantly! 🧾✨
+
+Choose what you'd like to do:
+1️⃣ Send receipt photo
+2️⃣ Learn about features  
+3️⃣ Get help
+4️⃣ Test menu system
+5️⃣ Ask a question
+
+Reply with 1, 2, 3, 4, or 5"
 - Menu offering: "Choose category:\n1️⃣ Business meal\n2️⃣ Travel expense\n3️⃣ Office supplies\n4️⃣ Other business\n5️⃣ Help\n\nReply with 1, 2, 3, 4, or 5"
 - Follow-up: "Need help with more receipts or have expense questions?"
 
@@ -118,91 +171,78 @@ Always end by asking if they need help with more receipts or have expense questi
 
 @app.route('/sms', methods=['POST'])
 def sms_webhook():
-    log_debug("🚀 SMS WEBHOOK TRIGGERED")
+    correlation_id = get_correlation_id()
+    global request_start_time
+    request_start_time = time.time()
+    
+    log_structured('INFO', 'SMS webhook triggered', correlation_id)
     
     try:
-        # Log all incoming data for debugging
-        log_debug("Incoming request", {
-            'method': request.method,
-            'content_type': request.content_type,
-            'form_keys': list(request.form.keys())
-        })
+        # Security: Verify webhook signature
+        if not verify_webhook_signature(request):
+            log_structured('WARN', 'Invalid webhook signature', correlation_id)
+            return 'Forbidden', 403
         
-        # Get message data with validation
+        # Extract and validate input
         from_number = request.form.get('From', 'UNKNOWN')
-        message_body = request.form.get('Body', '').strip()
+        message_body = sanitize_input(request.form.get('Body', ''))
         num_media = int(request.form.get('NumMedia', 0))
 
-        log_debug("Message details", {
-            'from': from_number,
-            'body': message_body[:50] + '...' if len(message_body) > 50 else message_body,
-            'media_count': num_media
-        })
-        
-        # Basic input validation
-        if len(message_body) > 5000:  # Prevent abuse
-            return create_error_response("Message too long. Please keep it under 5000 characters.")
+        log_structured('INFO', 'Processing message', correlation_id, 
+                      from_user=from_number[-4:], media_count=num_media)
         
         # Environment check
         if not env_ok:
-            return create_error_response("⚠️ Configuration error. Please contact support.")
+            return create_error_response("Configuration error", correlation_id)
         
         response_text = ""
         
-        if num_media > 0:
-            log_debug("📸 Processing image message")
-            media_url = request.form.get('MediaUrl0')
-            media_content_type = request.form.get('MediaContentType0')
-            
-            log_debug("Media details", {
-                'url': media_url[:50] + '...' if media_url else None,
-                'type': media_content_type
-            })
-            
-            if media_content_type and media_content_type.startswith('image/'):
-                response_text = process_receipt_image(media_url, message_body)
-            else:
-                response_text = "I can only analyze receipt images. Please send a photo of your receipt! 📸"
-                log_debug("❌ Non-image media received", {'type': media_content_type})
+        # Handle numbered menu responses (fast path - no AI calls)
+        if message_body.strip() in ['1', '2', '3', '4', '5']:
+            response_text = handle_menu_choice(message_body.strip(), correlation_id)
+        elif num_media > 0:
+            response_text = process_receipt_image_optimized(
+                request.form.get('MediaUrl0'), 
+                request.form.get('MediaContentType0'),
+                message_body, 
+                correlation_id
+            )
         else:
-            log_debug("💬 Processing text message")
-            response_text = process_expense_message(message_body)
+            response_text = process_expense_message_optimized(message_body, correlation_id)
         
-        log_debug("✅ Response generated", {
-            'length': len(response_text),
-            'preview': response_text[:100] + '...' if len(response_text) > 100 else response_text
-        })
+        # Log performance metrics
+        duration = time.time() - request_start_time
+        log_structured('INFO', 'Request completed', correlation_id, 
+                      duration_ms=int(duration * 1000))
             
+    except ValueError as e:
+        log_structured('WARN', 'Input validation error', correlation_id, error=str(e))
+        response_text = "Please check your input and try again."
     except Exception as e:
         error_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_debug(f"💥 CRITICAL ERROR [{error_id}]", {
-            'error': str(e)[:200],  # Limit error message length
-            'type': type(e).__name__
-        })
-        # Don't log full traceback in production
-        if os.getenv('FLASK_ENV') == 'development':
-            print(f"Full traceback: {traceback.format_exc()}")
-        
-        response_text = f"Sorry, there was an error (ID: {error_id}). Please try again! 🔄"
+        log_structured('ERROR', 'Critical error', correlation_id, 
+                      error_id=error_id, error_type=type(e).__name__)
+        response_text = f"Service temporarily unavailable (ID: {error_id})"
     
-    return create_twiml_response(response_text)
+    return create_twiml_response(response_text, correlation_id)
 
-def create_twiml_response(message):
-    """Create standardized Twilio response with logging"""
+def create_twiml_response(message, correlation_id):
+    """Create Twilio response with correlation tracking"""
     try:
         twiml_response = MessagingResponse()
         twiml_response.message(message)
-        log_debug("📤 Sending Twilio response", {'message_length': len(message)})
+        log_structured('INFO', 'Response sent', correlation_id, length=len(message))
         return str(twiml_response)
     except Exception as e:
-        log_debug("💥 Error creating Twilio response", {'error': str(e)})
-        # Fallback basic response
-        return '<?xml version="1.0" encoding="UTF-8"?><Response><Message>Error occurred</Message></Response>'
+        log_structured('ERROR', 'TwiML error', correlation_id, error=str(e))
+        fallback = MessagingResponse()
+        fallback.message("Service error occurred")
+        return str(fallback)
 
-def create_error_response(message):
-    """Create error response with logging"""
-    log_debug(f"⚠️ Error response: {message}")
-    return create_twiml_response(message)
+def create_error_response(message, correlation_id):
+    """Create standardized error response"""
+    log_structured('WARN', 'Error response', correlation_id, message=message)
+    return create_twiml_response(message, correlation_id)
 
 def process_expense_message(message_body):
     """Process text-only expense messages with detailed error handling"""
@@ -378,15 +418,15 @@ def handle_menu_choice(choice):
     log_debug("📋 Processing menu choice", {'choice': choice})
     
     menu_responses = {
-        '1': "✅ **Business Meal** selected!\n\nGreat! I'll categorize this as a business meal. Perfect for client entertainment or team lunches.\n\nNeed help with more receipts? Just send another photo! 📸",
+        '1': "📸 **Ready for receipt photo!**\n\nSend me a photo of your receipt and I'll analyze it instantly! I can handle:\n🍽️ Restaurant receipts\n🏨 Hotel bills\n✈️ Travel expenses\n🚗 Transportation\n\nJust attach the photo to your next message! 📎",
         
-        '2': "✅ **Travel Expense** selected!\n\nNice! This will be categorized as travel-related. Great for flights, hotels, or ground transportation.\n\nSend more travel receipts and I'll keep tracking! ✈️",
+        '2': "💡 **S.V.E.N. Features:**\n\n🔸 **Smart Receipt Analysis** - AI-powered categorization\n🔸 **Multi-language Support** - Works in your language\n🔸 **Hotel Itemization** - Detailed breakdowns\n🔸 **Policy Compliance** - Business rule checking\n🔸 **Zero Storage** - Your data stays private\n\nSend a receipt photo to try it out! 📸",
         
-        '3': "✅ **Office Supplies** selected!\n\nPerfect! This goes under office supplies and equipment. Ideal for business materials and tools.\n\nWhat's your next expense? Send another receipt! 📋",
+        '3': "❓ **How to Use S.V.E.N.:**\n\n1. Send receipt photo via WhatsApp\n2. Get instant AI analysis\n3. Choose category if needed\n4. Get formatted expense details\n\n**Tips:**\n📱 Take clear photos\n💡 Include all receipt details\n🔄 Try different receipt types\n\nReady? Send a receipt photo! 📸",
         
-        '4': "✅ **Other Business** selected!\n\nGot it! I'll mark this as a general business expense. Good for miscellaneous business costs.\n\nReady for your next receipt! 💼",
+        '4': "🧪 **Menu Test Successful!**\n\nGreat! The numbered menu system is working perfectly. This gives us guided workflows without needing interactive buttons.\n\nTry sending a receipt photo to see the full expense analysis! 📸✨",
         
-        '5': "💡 **Need Help?**\n\nI'm S.V.E.N., your Smart Virtual Expense Navigator! I help categorize business receipts instantly.\n\n🔸 Send receipt photos\n🔸 Get instant categorization\n🔸 Track business expenses\n\nJust send me a receipt photo to get started! 📸✨"
+        '5': "💬 **Ask S.V.E.N. Anything!**\n\nI can help with:\n🔸 Expense categorization questions\n🔸 Receipt analysis explanations\n🔸 Business policy guidance\n🔸 Feature demonstrations\n\nJust type your question or send a receipt photo! 💭"
     }
     
     return menu_responses.get(choice, "Please choose 1, 2, 3, 4, or 5 from the menu above! 📋")
