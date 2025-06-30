@@ -11,3 +11,5 @@ python-dotenv
 pillow
 requests
 gunicorn
+redis==4.5.4
+cryptography

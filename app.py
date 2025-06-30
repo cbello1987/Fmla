@@ -8,12 +8,15 @@ import requests
 from PIL import Image
 import io
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import hmac
 import uuid
 from functools import lru_cache
 import time
+import redis
+import json
+from cryptography.fernet import Fernet
 
 # Load environment variables
 load_dotenv()
@@ -40,6 +43,255 @@ def verify_webhook_signature(request):
     if os.getenv('FLASK_ENV') == 'development':
         return True  # Skip in dev
     return True
+
+# =================== REDIS INTEGRATION ===================
+
+def get_redis_client():
+    """Get Redis client with secure connection"""
+    try:
+        redis_url = os.environ.get('REDIS_URL')
+        if not redis_url:
+            return None
+        
+        # Parse Redis URL for secure connection
+        client = redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+            retry_on_timeout=True,
+            ssl_cert_reqs=None  # Required for Redis Cloud
+        )
+        
+        # Test connection
+        client.ping()
+        return client
+    except Exception as e:
+        log_structured('ERROR', 'Redis connection failed', get_correlation_id(), error=str(e)[:100])
+        return None
+
+def hash_phone_number(phone):
+    """Hash phone number for privacy"""
+    salt = "sven_expense_salt_2025"  # In production, use environment variable
+    return hashlib.sha256((phone + salt).encode()).hexdigest()[:16]
+
+def encrypt_sensitive_data(data):
+    """Encrypt sensitive data like amounts and vendors"""
+    try:
+        # Simple encryption key (in production, use proper key management)
+        key = base64.urlsafe_b64encode(b"sven_encryption_key_32_chars___")
+        fernet = Fernet(key)
+        return fernet.encrypt(str(data).encode()).decode()
+    except:
+        return str(data)  # Fallback to unencrypted if encryption fails
+
+def decrypt_sensitive_data(encrypted_data):
+    """Decrypt sensitive data"""
+    try:
+        key = base64.urlsafe_b64encode(b"sven_encryption_key_32_chars___")
+        fernet = Fernet(key)
+        return fernet.decrypt(encrypted_data.encode()).decode()
+    except:
+        return encrypted_data  # Return as-is if decryption fails
+
+def create_trip(phone_number, trip_name="Business Trip", business_purpose=""):
+    """Create a new business trip"""
+    redis_client = get_redis_client()
+    if not redis_client:
+        return None
+    
+    try:
+        phone_hash = hash_phone_number(phone_number)
+        trip_id = f"trip_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        trip_data = {
+            "trip_id": trip_id,
+            "name": trip_name,
+            "status": "active",
+            "created_at": datetime.utcnow().isoformat(),
+            "expires_at": (datetime.utcnow() + timedelta(days=7)).isoformat(),
+            "business_purpose": business_purpose,
+            "expenses": [],
+            "totals": {
+                "transportation": 0.0,
+                "lodging": 0.0,
+                "meals": 0.0,
+                "other": 0.0,
+                "total_business": 0.0,
+                "expense_count": 0
+            }
+        }
+        
+        # Store trip data with TTL
+        redis_client.hset(f"user:{phone_hash}:trips", trip_id, json.dumps(trip_data))
+        redis_client.expire(f"user:{phone_hash}:trips", 604800)  # 7 days
+        
+        # Update user profile
+        profile = {
+            "active_trip_id": trip_id,
+            "last_activity": datetime.utcnow().isoformat()
+        }
+        redis_client.hset(f"user:{phone_hash}:profile", mapping=profile)
+        redis_client.expire(f"user:{phone_hash}:profile", 2592000)  # 30 days
+        
+        return trip_data
+    except Exception as e:
+        log_structured('ERROR', 'Trip creation failed', get_correlation_id(), error=str(e)[:100])
+        return None
+
+def add_expense_to_trip(phone_number, expense_data):
+    """Add expense to user's active trip"""
+    redis_client = get_redis_client()
+    if not redis_client:
+        return None
+    
+    try:
+        phone_hash = hash_phone_number(phone_number)
+        
+        # Get user's active trip
+        profile_data = redis_client.hgetall(f"user:{phone_hash}:profile")
+        if not profile_data or "active_trip_id" not in profile_data:
+            return None
+        
+        active_trip_id = profile_data["active_trip_id"]
+        trip_json = redis_client.hget(f"user:{phone_hash}:trips", active_trip_id)
+        
+        if not trip_json:
+            return None
+        
+        trip_data = json.loads(trip_json)
+        
+        # Encrypt sensitive expense data
+        encrypted_expense = {
+            "expense_id": f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            "timestamp": datetime.utcnow().isoformat(),
+            "vendor": encrypt_sensitive_data(expense_data.get("vendor", "")),
+            "amount": encrypt_sensitive_data(expense_data.get("amount", 0)),
+            "category": expense_data.get("category", "other"),
+            "description": expense_data.get("description", ""),
+            "correlation_id": get_correlation_id()
+        }
+        
+        # Add to trip
+        trip_data["expenses"].append(encrypted_expense)
+        
+        # Update totals
+        amount = float(expense_data.get("amount", 0))
+        category = expense_data.get("category", "other")
+        
+        if category in trip_data["totals"]:
+            trip_data["totals"][category] += amount
+        else:
+            trip_data["totals"]["other"] += amount
+        
+        trip_data["totals"]["total_business"] += amount
+        trip_data["totals"]["expense_count"] += 1
+        
+        # Save updated trip
+        redis_client.hset(f"user:{phone_hash}:trips", active_trip_id, json.dumps(trip_data))
+        
+        return trip_data
+    except Exception as e:
+        log_structured('ERROR', 'Add expense failed', get_correlation_id(), error=str(e)[:100])
+        return None
+
+def get_user_trip_summary(phone_number):
+    """Get summary of user's active trip"""
+    redis_client = get_redis_client()
+    if not redis_client:
+        return None
+    
+    try:
+        phone_hash = hash_phone_number(phone_number)
+        profile_data = redis_client.hgetall(f"user:{phone_hash}:profile")
+        
+        if not profile_data or "active_trip_id" not in profile_data:
+            return None
+        
+        active_trip_id = profile_data["active_trip_id"]
+        trip_json = redis_client.hget(f"user:{phone_hash}:trips", active_trip_id)
+        
+        if not trip_json:
+            return None
+        
+        trip_data = json.loads(trip_json)
+        
+        # Decrypt for display (amounts only)
+        totals = trip_data["totals"]
+        return {
+            "trip_name": trip_data["name"],
+            "expense_count": totals["expense_count"],
+            "total_amount": totals["total_business"],
+            "categories": {
+                "meals": totals["meals"],
+                "lodging": totals["lodging"], 
+                "transportation": totals["transportation"],
+                "other": totals["other"]
+            }
+        }
+    except Exception as e:
+        log_structured('ERROR', 'Get trip summary failed', get_correlation_id(), error=str(e)[:100])
+        return None
+
+def delete_user_data(phone_number):
+    """Delete all user data - GDPR compliance"""
+    redis_client = get_redis_client()
+    if not redis_client:
+        return False
+    
+    try:
+        phone_hash = hash_phone_number(phone_number)
+        
+        # Delete all user data
+        redis_client.delete(f"user:{phone_hash}:profile")
+        redis_client.delete(f"user:{phone_hash}:trips")
+        
+        return True
+    except Exception as e:
+        log_structured('ERROR', 'Delete user data failed', get_correlation_id(), error=str(e)[:100])
+        return False
+
+def extract_expense_data(message, ai_response):
+    """Extract expense data from message and AI response"""
+    try:
+        # Simple extraction - look for dollar amounts and common vendors
+        import re
+        
+        # Find dollar amounts
+        amounts = re.findall(r'\$?(\d+\.?\d*)', message + " " + ai_response)
+        amount = float(amounts[0]) if amounts else 0
+        
+        if amount == 0:
+            return None
+        
+        # Determine category from keywords
+        message_lower = message.lower() + " " + ai_response.lower()
+        
+        if any(word in message_lower for word in ["hotel", "room", "accommodation", "lodging"]):
+            category = "lodging"
+        elif any(word in message_lower for word in ["uber", "taxi", "flight", "parking", "gas", "mileage"]):
+            category = "transportation"  
+        elif any(word in message_lower for word in ["restaurant", "dinner", "lunch", "coffee", "meal"]):
+            category = "meals"
+        else:
+            category = "other"
+        
+        # Extract vendor name (simple approach)
+        vendor = "Business Expense"
+        vendor_patterns = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', message)
+        if vendor_patterns:
+            vendor = vendor_patterns[0]
+        
+        return {
+            "amount": amount,
+            "category": category,
+            "vendor": vendor,
+            "description": message[:100]
+        }
+    except:
+        return None
+
+# =================== EXISTING FUNCTIONS ===================
 
 @lru_cache(maxsize=100)
 def get_cached_response(message_hash):
@@ -98,7 +350,7 @@ def check_environment():
 # Check environment on startup
 env_ok = check_environment()
 
-# S.V.E.N. Expert System Prompt
+# S.V.E.N. Expert System Prompt with Trip Intelligence
 SVEN_PROMPT = """You are S.V.E.N. (Smart Virtual Expense Navigator), an AI-powered expense assistant that helps people categorize receipts and manage business expenses with Nordic efficiency and intelligence.
 
 KEY PRINCIPLES:
@@ -168,7 +420,37 @@ Reply with 1, 2, 3, 4, or 5"
 
 Always end by asking if they need help with more receipts or have expense questions. This is an educational demo only."""
 
-@app.route('/sms', methods=['POST'])
+@app.route('/debug', methods=['GET'])
+def debug_info():
+    """Debug endpoint - RESTRICT IN PRODUCTION"""
+    if os.getenv('FLASK_ENV') != 'development':
+        return "Debug endpoint disabled in production", 404
+    
+    debug_data = {
+        'timestamp': datetime.now().isoformat(),
+        'environment_ok': env_ok,
+        'openai_key_present': bool(os.getenv('OPENAI_API_KEY')),
+        'twilio_sid_present': bool(os.getenv('TWILIO_ACCOUNT_SID')),
+        'redis_url_present': bool(os.getenv('REDIS_URL')),
+        'flask_app': 'S.V.E.N. v2.0 with Redis Trip Intelligence'
+    }
+    
+    # Test Redis connection in debug
+    try:
+        redis_client = get_redis_client()
+        if redis_client:
+            debug_data['redis_test'] = 'success'
+            debug_data['redis_info'] = redis_client.info('server')['redis_version']
+        else:
+            debug_data['redis_test'] = 'failed'
+    except Exception as e:
+        debug_data['redis_test'] = f'error: {str(e)[:50]}'
+    
+    return debug_data, 200
+
+if __name__ == '__main__':
+    log_structured('INFO', "S.V.E.N. with Trip Intelligence starting up")
+    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))sms', methods=['POST'])
 def sms_webhook():
     correlation_id = get_correlation_id()
     global request_start_time
@@ -203,14 +485,15 @@ def sms_webhook():
         if message_body.strip() in ['1', '2', '3', '4', '5']:
             response_text = handle_menu_choice(message_body.strip(), correlation_id)
         elif num_media > 0:
-            response_text = process_receipt_image_optimized(
+            response_text = process_receipt_image_with_trips(
                 request.form.get('MediaUrl0'), 
                 request.form.get('MediaContentType0'),
                 message_body, 
+                from_number,
                 correlation_id
             )
         else:
-            response_text = process_expense_message_optimized(message_body, correlation_id)
+            response_text = process_expense_message_with_trips(message_body, from_number, correlation_id)
         
         # Log performance metrics
         duration = time.time() - request_start_time
@@ -228,26 +511,26 @@ def sms_webhook():
     
     return create_twiml_response(response_text, correlation_id)
 
-def create_twiml_response(message, correlation_id):
-    """Create Twilio response with correlation tracking"""
-    try:
-        twiml_response = MessagingResponse()
-        twiml_response.message(message)
-        log_structured('INFO', 'Response sent', correlation_id, length=len(message))
-        return str(twiml_response)
-    except Exception as e:
-        log_structured('ERROR', 'TwiML error', correlation_id, error=str(e))
-        fallback = MessagingResponse()
-        fallback.message("Service error occurred")
-        return str(fallback)
-
-def create_error_response(message, correlation_id):
-    """Create standardized error response"""
-    log_structured('WARN', 'Error response', correlation_id, message=message)
-    return create_twiml_response(message, correlation_id)
-
-def process_expense_message_optimized(message_body, correlation_id):
-    """Optimized text processing with caching and circuit breaker"""
+def process_expense_message_with_trips(message_body, phone_number, correlation_id):
+    """Enhanced expense processing with trip intelligence"""
+    
+    # Check for data deletion request
+    if "delete my data" in message_body.lower():
+        if delete_user_data(phone_number):
+            return "✅ All your data has been deleted from S.V.E.N. You can start fresh anytime!"
+        else:
+            return "❌ Unable to delete data right now. Please try again later."
+    
+    # Check for trip creation request
+    if "yes" in message_body.lower() and len(message_body) < 10:
+        trip_data = create_trip(phone_number, "Business Trip")
+        if trip_data:
+            return "🚀 Business trip created! Send me your first receipt photo to get started!"
+        else:
+            return "Trip creation not available right now. Continuing without trip tracking."
+    
+    # Get user's current trip status
+    trip_summary = get_user_trip_summary(phone_number)
     
     # Fast path: Check cache first
     message_hash = hashlib.md5(message_body.encode()).hexdigest()
@@ -259,38 +542,50 @@ def process_expense_message_optimized(message_body, correlation_id):
     log_structured('INFO', 'OpenAI text processing', correlation_id)
     
     try:
+        # Build context-aware prompt
+        context = ""
+        if trip_summary:
+            context = f"\nCURRENT TRIP: {trip_summary['trip_name']} with {trip_summary['expense_count']} expenses totaling ${trip_summary['total_amount']:.2f}"
+        
         response = openai.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": SVEN_PROMPT},
+                {"role": "system", "content": SVEN_PROMPT + context},
                 {"role": "user", "content": message_body}
             ],
-            max_tokens=600,  # Reduced for speed
-            temperature=0.5,  # Reduced for consistency
-            timeout=12  # Shorter timeout
+            max_tokens=600,
+            temperature=0.5,
+            timeout=12
         )
         
         result = response.choices[0].message.content
         
+        # Try to extract expense data for trip tracking
+        expense_data = extract_expense_data(message_body, result)
+        
+        if expense_data and expense_data.get("amount", 0) > 0:
+            if trip_summary:
+                # Add to existing trip
+                updated_trip = add_expense_to_trip(phone_number, expense_data)
+                if updated_trip:
+                    totals = updated_trip["totals"]
+                    return f"✅ Added to {updated_trip['name']}!\n\n💰 Trip total: ${totals['total_business']:.2f} ({totals['expense_count']} expenses)\n\n{result}"
+            else:
+                # Offer to create new trip
+                return f"{result}\n\n🚀 Want to start a business trip for this expense? Reply 'yes' to create one!"
+        
         # Cache successful response
         cache_response(message_hash, result)
         
-        log_structured('INFO', 'OpenAI success', correlation_id, 
-                      tokens=response.usage.total_tokens if hasattr(response, 'usage') else 0)
+        log_structured('INFO', 'OpenAI success', correlation_id)
         return result
         
-    except openai.RateLimitError:
-        log_structured('WARN', 'Rate limit hit', correlation_id)
-        return "Service busy. Please try again in a moment."
-    except openai.AuthenticationError:
-        log_structured('ERROR', 'Auth error', correlation_id)
-        return "Service temporarily unavailable."
     except Exception as e:
         log_structured('ERROR', 'OpenAI error', correlation_id, error=str(e)[:100])
         return "Sorry, please try again."
 
-def process_receipt_image_optimized(media_url, content_type, message_body, correlation_id):
-    """Optimized image processing with validation and circuit breaker"""
+def process_receipt_image_with_trips(media_url, content_type, message_body, phone_number, correlation_id):
+    """Enhanced image processing with trip intelligence"""
     
     log_structured('INFO', 'Image processing start', correlation_id)
     
@@ -313,13 +608,19 @@ def process_receipt_image_optimized(media_url, content_type, message_body, corre
         if len(response.content) > 8 * 1024 * 1024:  # 8MB limit
             return "Image too large. Please send a smaller photo."
         
+        # Get trip context
+        trip_summary = get_user_trip_summary(phone_number)
+        context = ""
+        if trip_summary:
+            context = f"\nCURRENT TRIP: {trip_summary['trip_name']} with {trip_summary['expense_count']} expenses totaling ${trip_summary['total_amount']:.2f}"
+        
         # Process with OpenAI
         image_data = base64.b64encode(response.content).decode('utf-8')
         
         openai_response = openai.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": SVEN_PROMPT},
+                {"role": "system", "content": SVEN_PROMPT + context},
                 {"role": "user", "content": [
                     {"type": "text", "text": "Analyze this receipt"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
@@ -331,14 +632,45 @@ def process_receipt_image_optimized(media_url, content_type, message_body, corre
         )
         
         result = openai_response.choices[0].message.content
+        
+        # Extract expense data and add to trip
+        expense_data = extract_expense_data("receipt image", result)
+        
+        if expense_data and expense_data.get("amount", 0) > 0:
+            if trip_summary:
+                # Add to existing trip
+                updated_trip = add_expense_to_trip(phone_number, expense_data)
+                if updated_trip:
+                    totals = updated_trip["totals"]
+                    result += f"\n\n✅ Added to {updated_trip['name']}!\n💰 Trip total: ${totals['total_business']:.2f} ({totals['expense_count']} expenses)"
+            else:
+                # Offer to create new trip
+                result += f"\n\n🚀 Want to start a business trip? Reply 'yes' to track this with other expenses!"
+        
         log_structured('INFO', 'Image processing success', correlation_id)
         return result
         
-    except requests.Timeout:
-        return "Image processing timed out. Please try again."
     except Exception as e:
         log_structured('ERROR', 'Image processing error', correlation_id, error=str(e)[:100])
         return "Could not process image. Please try again."
+
+def create_twiml_response(message, correlation_id):
+    """Create Twilio response with correlation tracking"""
+    try:
+        twiml_response = MessagingResponse()
+        twiml_response.message(message)
+        log_structured('INFO', 'Response sent', correlation_id, length=len(message))
+        return str(twiml_response)
+    except Exception as e:
+        log_structured('ERROR', 'TwiML error', correlation_id, error=str(e))
+        fallback = MessagingResponse()
+        fallback.message("Service error occurred")
+        return str(fallback)
+
+def create_error_response(message, correlation_id):
+    """Create standardized error response"""
+    log_structured('WARN', 'Error response', correlation_id, message=message)
+    return create_twiml_response(message, correlation_id)
 
 def handle_menu_choice(choice, correlation_id):
     """Handle menu choices - fast path with no AI calls"""
@@ -347,20 +679,20 @@ def handle_menu_choice(choice, correlation_id):
     menu_responses = {
         '1': "📸 **Ready for receipt photo!**\n\nSend me a photo of your receipt and I'll analyze it instantly! I can handle:\n🍽️ Restaurant receipts\n🏨 Hotel bills\n✈️ Travel expenses\n🚗 Transportation\n\nJust attach the photo to your next message! 📎",
         
-        '2': "💡 **S.V.E.N. Features:**\n\n🔸 **Smart Receipt Analysis** - AI-powered categorization\n🔸 **Multi-language Support** - Works in your language\n🔸 **Hotel Itemization** - Detailed breakdowns\n🔸 **Policy Compliance** - Business rule checking\n🔸 **Zero Storage** - Your data stays private\n\nSend a receipt photo to try it out! 📸",
+        '2': "💡 **S.V.E.N. Features:**\n\n🔸 **Smart Receipt Analysis** - AI-powered categorization\n🔸 **Trip Tracking** - Group expenses by business trip\n🔸 **Multi-language Support** - Works in your language\n🔸 **Hotel Itemization** - Detailed breakdowns\n🔸 **Policy Compliance** - Business rule checking\n🔸 **Zero Image Storage** - Your data stays private\n\nSend a receipt photo to try it out! 📸",
         
-        '3': "❓ **How to Use S.V.E.N.:**\n\n1. Send receipt photo via WhatsApp\n2. Get instant AI analysis\n3. Choose category if needed\n4. Get formatted expense details\n\n**Tips:**\n📱 Take clear photos\n💡 Include all receipt details\n🔄 Try different receipt types\n\nReady? Send a receipt photo! 📸",
+        '3': "❓ **How to Use S.V.E.N.:**\n\n1. Send receipt photo via WhatsApp\n2. Get instant AI analysis\n3. Create business trips to group expenses\n4. Get formatted expense details\n\n**Tips:**\n📱 Take clear photos\n💡 Group expenses into trips\n🔄 Try different receipt types\n🗑️ Type 'delete my data' to clear everything\n\nReady? Send a receipt photo! 📸",
         
-        '4': "🧪 **Menu Test Successful!**\n\nGreat! The numbered menu system is working perfectly. This gives us guided workflows without needing interactive buttons.\n\nTry sending a receipt photo to see the full expense analysis! 📸✨",
+        '4': "🧪 **Menu Test Successful!**\n\nGreat! The numbered menu system is working perfectly. This gives us guided workflows without needing interactive buttons.\n\nTry sending a receipt photo to see the full expense analysis with trip tracking! 📸✨",
         
-        '5': "💬 **Ask S.V.E.N. Anything!**\n\nI can help with:\n🔸 Expense categorization questions\n🔸 Receipt analysis explanations\n🔸 Business policy guidance\n🔸 Feature demonstrations\n\nJust type your question or send a receipt photo! 💭"
+        '5': "💬 **Ask S.V.E.N. Anything!**\n\nI can help with:\n🔸 Expense categorization questions\n🔸 Receipt analysis explanations\n🔸 Business trip organization\n🔸 Policy guidance\n🔸 Feature demonstrations\n\nJust type your question or send a receipt photo! 💭"
     }
     
     return menu_responses.get(choice, "Please choose 1, 2, 3, 4, or 5 from the menu above! 📋")
 
 @app.route('/', methods=['GET'])
 def home():
-    return "S.V.E.N. (Smart Virtual Expense Navigator) is running! 🤖 Text +18775374013 to start managing expenses!", 200
+    return "S.V.E.N. (Smart Virtual Expense Navigator) with Trip Intelligence is running! 🤖 Text +18775374013 to start managing expenses!", 200
 
 @app.route('/ping', methods=['GET'])
 def ping():
@@ -377,6 +709,16 @@ def health_check():
         'cache_size': len(response_cache),
         'memory_usage': f"{len(str(response_cache)) / 1024:.1f}KB"
     }
+    
+    # Test Redis connectivity
+    try:
+        redis_client = get_redis_client()
+        if redis_client:
+            health_data['redis_status'] = 'connected'
+        else:
+            health_data['redis_status'] = 'disconnected'
+    except:
+        health_data['redis_status'] = 'error'
     
     # Test OpenAI connectivity
     try:
@@ -401,11 +743,23 @@ def debug_info():
         'environment_ok': env_ok,
         'openai_key_present': bool(os.getenv('OPENAI_API_KEY')),
         'twilio_sid_present': bool(os.getenv('TWILIO_ACCOUNT_SID')),
-        'flask_app': 'S.V.E.N. v2.0'
+        'redis_url_present': bool(os.getenv('REDIS_URL')),
+        'flask_app': 'S.V.E.N. v2.0 with Redis Trip Intelligence'
     }
+    
+    # Test Redis connection in debug
+    try:
+        redis_client = get_redis_client()
+        if redis_client:
+            debug_data['redis_test'] = 'success'
+            debug_data['redis_info'] = redis_client.info('server')['redis_version']
+        else:
+            debug_data['redis_test'] = 'failed'
+    except Exception as e:
+        debug_data['redis_test'] = f'error: {str(e)[:50]}'
     
     return debug_data, 200
 
 if __name__ == '__main__':
-    log_structured('INFO', "S.V.E.N. starting up")
+    log_structured('INFO', "S.V.E.N. with Trip Intelligence starting up")
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
