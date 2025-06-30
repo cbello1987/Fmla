@@ -760,6 +760,67 @@ def debug_info():
     
     return debug_data, 200
 
+@app.route('/sms', methods=['POST'])
+def sms_webhook():
+    correlation_id = get_correlation_id()
+    global request_start_time
+    request_start_time = time.time()
+    
+    log_structured('INFO', 'SMS webhook triggered', correlation_id)
+    
+    try:
+        # Security: Verify webhook signature
+        if not verify_webhook_signature(request):
+            log_structured('WARN', 'Invalid webhook signature', correlation_id)
+            return 'Forbidden', 403
+        
+        # Extract and validate input
+        from_number = request.form.get('From', 'UNKNOWN')
+        message_body = sanitize_input(request.form.get('Body', ''))
+        num_media = int(request.form.get('NumMedia', 0))
+
+        log_structured('INFO', 'Processing message', correlation_id, 
+                      from_user=from_number[-4:], media_count=num_media)
+        
+        # Environment check with graceful degradation
+        if not env_ok:
+            return create_error_response(
+                "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄", 
+                correlation_id
+            )
+        
+        response_text = ""
+        
+        # Handle numbered menu responses (fast path - no AI calls)
+        if message_body.strip() in ['1', '2', '3', '4', '5']:
+            response_text = handle_menu_choice(message_body.strip(), correlation_id)
+        elif num_media > 0:
+            response_text = process_receipt_image_with_trips(
+                request.form.get('MediaUrl0'), 
+                request.form.get('MediaContentType0'),
+                message_body, 
+                from_number,
+                correlation_id
+            )
+        else:
+            response_text = process_expense_message_with_trips(message_body, from_number, correlation_id)
+        
+        # Log performance metrics
+        duration = time.time() - request_start_time
+        log_structured('INFO', 'Request completed', correlation_id, 
+                      duration_ms=int(duration * 1000))
+            
+    except ValueError as e:
+        log_structured('WARN', 'Input validation error', correlation_id, error=str(e))
+        response_text = "Please check your input and try again."
+    except Exception as e:
+        error_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_structured('ERROR', 'Critical error', correlation_id, 
+                      error_id=error_id, error_type=type(e).__name__)
+        response_text = f"Service temporarily unavailable (ID: {error_id})"
+    
+    return create_twiml_response(response_text, correlation_id)
+
 if __name__ == '__main__':
     log_structured('INFO', "S.V.E.N. with Trip Intelligence starting up")
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
