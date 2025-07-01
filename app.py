@@ -60,7 +60,6 @@ def get_redis_client():
             socket_connect_timeout=5,
             socket_timeout=5,
             retry_on_timeout=True,
-            ssl_cert_reqs=None  # Required for Redis Cloud
         )
         
         # Test connection
