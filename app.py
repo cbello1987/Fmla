@@ -251,43 +251,79 @@ def delete_user_data(phone_number):
         return False
 
 def extract_expense_data(message, ai_response):
-    """Extract expense data from message and AI response"""
+    """Extract expense data from message and AI response - ENHANCED VERSION"""
     try:
-        # Simple extraction - look for dollar amounts and common vendors
         import re
         
-        # Find dollar amounts
-        amounts = re.findall(r'\$?(\d+\.?\d*)', message + " " + ai_response)
-        amount = float(amounts[0]) if amounts else 0
+        # Combine message and AI response for analysis
+        text = message + " " + ai_response
         
-        if amount == 0:
+        # SMART AMOUNT DETECTION - Priority order
+        amount = 0
+        
+        # 1. Look for explicit "Total:" patterns first
+        total_patterns = re.findall(r'(?:total|amount|grand total):\s*\$?(\d+\.?\d*)', text.lower())
+        if total_patterns:
+            amount = float(total_patterns[-1])  # Take the last/final total
+        
+        # 2. Look for "Total $XXX.XX" patterns
+        elif re.search(r'total\s+\$(\d+\.?\d*)', text.lower()):
+            total_match = re.search(r'total\s+\$(\d+\.?\d*)', text.lower())
+            amount = float(total_match.group(1))
+        
+        # 3. Find the largest dollar amount (likely the total)
+        else:
+            amounts = re.findall(r'\$(\d+\.?\d*)', text)
+            if amounts:
+                # Convert to floats and filter out small amounts (tax, tips, etc.)
+                float_amounts = [float(a) for a in amounts if float(a) >= 5.0]  # Ignore amounts under $5
+                if float_amounts:
+                    amount = max(float_amounts)  # Take the largest amount
+        
+        # If no valid amount found, return None
+        if amount == 0 or amount < 1.0:
             return None
         
-        # Determine category from keywords
-        message_lower = message.lower() + " " + ai_response.lower()
+        # SMART CATEGORY DETECTION
+        text_lower = text.lower()
         
-        if any(word in message_lower for word in ["hotel", "room", "accommodation", "lodging"]):
+        if any(word in text_lower for word in ["hotel", "room", "accommodation", "lodging", "inn", "resort"]):
             category = "lodging"
-        elif any(word in message_lower for word in ["uber", "taxi", "flight", "parking", "gas", "mileage"]):
+        elif any(word in text_lower for word in ["uber", "taxi", "flight", "parking", "gas", "mileage", "airport", "airline"]):
             category = "transportation"  
-        elif any(word in message_lower for word in ["restaurant", "dinner", "lunch", "coffee", "meal"]):
+        elif any(word in text_lower for word in ["restaurant", "dinner", "lunch", "coffee", "meal", "food", "bar", "brewing", "cafe"]):
             category = "meals"
+        elif any(word in text_lower for word in ["office", "supplies", "equipment", "software", "subscription"]):
+            category = "office"
         else:
             category = "other"
         
-        # Extract vendor name (simple approach)
+        # SMART VENDOR EXTRACTION
         vendor = "Business Expense"
-        vendor_patterns = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', message)
-        if vendor_patterns:
-            vendor = vendor_patterns[0]
+        
+        # Look for merchant names in AI response
+        merchant_patterns = re.findall(r'(?:merchant|from|at):\s*([A-Za-z][A-Za-z\s&]+?)(?:\s|$|\n)', text)
+        if merchant_patterns:
+            vendor = merchant_patterns[0].strip()
+        else:
+            # Fallback: Look for capitalized words (likely business names)
+            vendor_patterns = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', text)
+            if vendor_patterns:
+                # Filter out common words
+                filtered = [v for v in vendor_patterns if v not in ['Date', 'Total', 'Amount', 'Tax', 'Items', 'Payment']]
+                if filtered:
+                    vendor = filtered[0]
         
         return {
-            "amount": amount,
+            "amount": round(amount, 2),  # Round to 2 decimal places
             "category": category,
-            "vendor": vendor,
+            "vendor": vendor[:50],  # Limit vendor name length
             "description": message[:100]
         }
-    except:
+        
+    except Exception as e:
+        # Log error but don't crash
+        print(f"Extract expense error: {str(e)[:50]}")
         return None
 
 # =================== EXISTING FUNCTIONS ===================
