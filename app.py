@@ -505,6 +505,69 @@ def process_expense_message_with_trips(message_body, phone_number, correlation_i
         else:
             return "❌ Unable to delete data right now. Please try again later."
     
+    # NEW COMMAND DETECTION
+    message_lower = message_body.lower().strip()
+    
+    # Menu command
+    if "menu" in message_lower or "help" in message_lower:
+        return """I'm S.V.E.N., your Smart Virtual Expense Navigator! 🧾✨
+
+Choose what you'd like to do:
+1️⃣ Send receipt photo
+2️⃣ Learn about features  
+3️⃣ Get help
+4️⃣ Test menu system
+5️⃣ Ask a question
+
+Reply with 1, 2, 3, 4, or 5. This is an educational demo only."""
+    
+    # Trip status commands
+    if any(phrase in message_lower for phrase in ["trip total", "trip summary", "how much", "show expenses", "my expenses"]):
+        trip_summary = get_user_trip_summary(phone_number)
+        if trip_summary:
+            categories = trip_summary['categories']
+            breakdown = ""
+            for category, amount in categories.items():
+                if amount > 0:
+                    breakdown += f"• {category.title()}: ${amount:.2f}\n"
+            
+            return f"""📊 **{trip_summary['trip_name']} Summary**
+
+💰 **Total**: ${trip_summary['total_amount']:.2f}
+📝 **Expenses**: {trip_summary['expense_count']} items
+
+**Breakdown by category:**
+{breakdown}
+Need help with more receipts? This is an educational demo only."""
+        else:
+            return "You don't have an active trip yet. Send a receipt photo to start one! This is an educational demo only."
+    
+    # End trip command
+    if any(phrase in message_lower for phrase in ["end trip", "finish trip", "complete trip", "close trip"]):
+        trip_summary = get_user_trip_summary(phone_number)
+        if trip_summary:
+            # Archive the trip
+            redis_client = get_redis_client()
+            if redis_client:
+                phone_hash = hash_phone_number(phone_number)
+                redis_client.hdel(f"user:{phone_hash}:profile", "active_trip_id")
+            
+            return f"""✅ **Trip Completed!**
+
+📊 Final Summary: ${trip_summary['total_amount']:.2f} ({trip_summary['expense_count']} expenses)
+
+Your trip has been archived. Send a new receipt photo to start your next trip!
+
+Need help with more receipts? This is an educational demo only."""
+        else:
+            return "You don't have an active trip to end. This is an educational demo only."
+
+
+
+
+
+
+    
     # Check for trip creation request
     if "yes" in message_body.lower() and len(message_body) < 10:
         trip_data = create_trip(phone_number, "Business Trip")
