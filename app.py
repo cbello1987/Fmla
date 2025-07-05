@@ -724,7 +724,7 @@ def handle_menu_choice(choice, correlation_id):
     log_structured('INFO', 'Menu choice', correlation_id, choice=choice)
     
     menu_responses = {
-        '1': "📸 **Ready for receipt photo!**\n\nSend me a photo of your receipt and I'll analyze it instantly! I can handle:\n🍽️ Restaurant receipts\n🏨 Hotel bills\n✈️ Travel expenses\n🚗 Transportation\n\nJust attach the photo to your next message! 📎",
+        '1': "👨‍👩‍👧‍👦 **Let's Set Up Your Family!**\n\nTell me your children's names and ages. For example:\n'My kids are Emma (8) and Jack (6)'\n\nThis helps me track their activities accurately! 🎯",
         
         '2': "💡 **S.V.E.N. Features:**\n\n🔸 **Smart Receipt Analysis** - AI-powered categorization\n🔸 **Trip Tracking** - Group expenses by business trip\n🔸 **Multi-language Support** - Works in your language\n🔸 **Hotel Itemization** - Detailed breakdowns\n🔸 **Policy Compliance** - Business rule checking\n🔸 **Zero Image Storage** - Your data stays private\n\nSend a receipt photo to try it out! 📸",
         
