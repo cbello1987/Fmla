@@ -562,15 +562,7 @@ def sms_webhook():
     
     return create_twiml_response(response_text, correlation_id)
 
-def process_expense_message_with_trips(message_body, phone_number, correlation_id):
-    """Enhanced expense processing with trip intelligence"""
-    
-    # Check for data deletion request
-    if "delete my data" in message_body.lower():
-        if delete_user_data(phone_number):
-            return "✅ All your data has been deleted from S.V.E.N. You can start fresh anytime!"
-        else:
-            return "❌ Unable to delete data right now. Please try again later."
+
     
     def process_expense_message_with_trips(message_body, phone_number, correlation_id):
     """Enhanced expense processing with trip intelligence"""
