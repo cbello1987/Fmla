@@ -497,7 +497,6 @@ def handle_menu_choice(choice, correlation_id):
     
     return menu_responses.get(choice, "Please choose 1, 2, 3, 4, or 5! 📋")
 
-Only work with real data the user provides."""
 
 # =================== WEBHOOK HANDLERS ===================
 
@@ -593,10 +592,10 @@ def process_expense_message_with_trips(message_body, phone_number, correlation_i
     
     # Menu command
     if "menu" in message_lower or "help" in message_lower:
-        return """I'm S.V.E.N., your Smart Virtual Expense Navigator! 🧾✨
+        return """I'm S.V.E.N., your Smart Virtual Event Navigator! 📅✨
 
 Choose what you'd like to do:
-1️⃣ Send receipt photo
+1️⃣ Set up your family
 2️⃣ Learn about features  
 3️⃣ Get help
 4️⃣ Test menu system
