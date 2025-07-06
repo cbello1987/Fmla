@@ -534,6 +534,16 @@ def sms_webhook():
         # Handle numbered menu responses (fast path - no AI calls)
         if message_body.strip() in ['1', '2', '3', '4', '5']:
             response_text = handle_menu_choice(message_body.strip(), correlation_id)
+
+        # Check for voice messages
+        elif request.form.get('MediaContentType0', '').startswith('audio/'):
+             response_text = process_voice_message(
+                request.form.get('MediaUrl0'),
+                from_number,
+                 correlation_id
+            )
+
+
         elif num_media > 0:
             response_text = process_receipt_image_with_trips(
                 request.form.get('MediaUrl0'), 
@@ -561,7 +571,13 @@ def sms_webhook():
     
     return create_twiml_response(response_text, correlation_id)
 
-
+def process_voice_message(audio_url, phone_number, correlation_id):
+    """Process voice messages for family scheduling"""
+    log_structured('INFO', 'Voice message received', correlation_id)
+    
+    # For now, just acknowledge we got it
+    return ("🎙️ I heard your voice message! Voice transcription coming soon. "
+            "For now, try typing: 'Soccer practice Thursday 4:30' 🎯")
     
 def process_expense_message_with_trips(message_body, phone_number, correlation_id):
     """Enhanced expense processing with trip intelligence"""
