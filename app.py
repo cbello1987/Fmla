@@ -37,6 +37,17 @@ def get_correlation_id():
     """Generate unique request ID for tracing"""
     return str(uuid.uuid4())[:8]
 
+# ... all your imports and other functions ...
+
+def create_twiml_response(message, correlation_id=None):
+    # ... (as above) ...
+
+@app.route('/sms', methods=['POST'])
+def sms_webhook():
+    # ... your code ...
+    return create_twiml_response(response_text, correlation_id)
+
+
 def verify_webhook_signature(request):
     """Verify Twilio webhook signature for security"""
     if os.getenv('FLASK_ENV') == 'development':
