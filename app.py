@@ -39,12 +39,77 @@ def get_correlation_id():
 
 # ... all your imports and other functions ...
 
+
 def create_twiml_response(message, correlation_id=None):
-    # ... (as above) ...
+    resp = MessagingResponse()
+    resp.message(message)
+    return str(resp)
+
+# Error response helper
+def create_error_response(message, correlation_id=None):
+    return create_twiml_response(message, correlation_id)
+
+# Stub for missing handler functions
+def process_voice_message(media_url, from_number, correlation_id):
+    return "Voice message processing is not yet implemented."
+
+def process_receipt_image_with_trips(media_url, media_type, message_body, from_number, correlation_id):
+    return "Receipt image processing is not yet implemented."
+
+def process_expense_message_with_trips(message_body, from_number, correlation_id):
+    return "Expense message processing is not yet implemented."
+
 
 @app.route('/sms', methods=['POST'])
 def sms_webhook():
-    # ... your code ...
+    correlation_id = get_correlation_id()
+    global request_start_time
+    request_start_time = time.time()
+    log_structured('INFO', 'SMS webhook triggered', correlation_id)
+    try:
+        if not verify_webhook_signature(request):
+            log_structured('WARN', 'Invalid webhook signature', correlation_id)
+            return 'Forbidden', 403
+        from_number = request.form.get('From', 'UNKNOWN')
+        message_body = sanitize_input(request.form.get('Body', ''))
+        num_media = int(request.form.get('NumMedia', 0))
+        log_structured('INFO', 'Processing message', correlation_id,
+                       from_user=from_number[-4:], media_count=num_media)
+        if not env_ok:
+            return create_error_response(
+                "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄",
+                correlation_id
+            )
+        response_text = ""
+        if message_body.strip() in ['1', '2', '3', '4', '5']:
+            response_text = handle_menu_choice(message_body.strip(), correlation_id)
+        elif request.form.get('MediaContentType0', '').startswith('audio/'):
+            response_text = process_voice_message(
+                request.form.get('MediaUrl0'),
+                from_number,
+                correlation_id
+            )
+        elif num_media > 0:
+            response_text = process_receipt_image_with_trips(
+                request.form.get('MediaUrl0'),
+                request.form.get('MediaContentType0'),
+                message_body,
+                from_number,
+                correlation_id
+            )
+        else:
+            response_text = process_expense_message_with_trips(message_body, from_number, correlation_id)
+        duration = time.time() - request_start_time
+        log_structured('INFO', 'Request completed', correlation_id,
+                       duration_ms=int(duration * 1000))
+    except ValueError as e:
+        log_structured('WARN', 'Input validation error', correlation_id, error=str(e))
+        response_text = "Please check your input and try again."
+    except Exception as e:
+        error_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_structured('ERROR', 'Critical error', correlation_id,
+                       error_id=error_id, error_type=type(e).__name__)
+        response_text = f"Service temporarily unavailable (ID: {error_id})"
     return create_twiml_response(response_text, correlation_id)
 
 
