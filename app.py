@@ -575,9 +575,105 @@ def process_voice_message(audio_url, phone_number, correlation_id):
     """Process voice messages for family scheduling"""
     log_structured('INFO', 'Voice message received', correlation_id)
     
-    # For now, just acknowledge we got it
-    return ("🎙️ I heard your voice message! Voice transcription coming soon. "
-            "For now, try typing: 'Soccer practice Thursday 4:30' 🎯")
+    try:
+        # Download audio from Twilio
+        twilio_sid = os.getenv('TWILIO_ACCOUNT_SID')
+        twilio_token = os.getenv('TWILIO_AUTH_TOKEN')
+        
+        response = requests.get(audio_url, auth=(twilio_sid, twilio_token), timeout=10)
+        
+        if response.status_code != 200:
+            log_structured('WARN', 'Audio download failed', correlation_id, status=response.status_code)
+            return "Could not download voice message. Please try again."
+        
+        # Save audio temporarily
+        audio_data = io.BytesIO(response.content)
+        audio_data.name = "voice_message.ogg"
+        
+        # Transcribe with Whisper
+        log_structured('INFO', 'Transcribing with Whisper', correlation_id)
+        
+        transcript = openai.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_data,
+            language="en"
+        )
+        
+        transcribed_text = transcript.text
+        log_structured('INFO', 'Transcription complete', correlation_id, text=transcribed_text[:50])
+        
+        # Parse the event using GPT-4
+        event_data = parse_event_from_voice(transcribed_text, phone_number)
+        
+        if event_data:
+            # Format the parsed data nicely
+            return f"""🎙️ I heard: "{transcribed_text}"
+
+✅ I understood:
+⚽ Activity: {event_data.get('activity', 'Unknown')}
+👶 Child: {event_data.get('child', 'Not specified')}
+📅 Day: {event_data.get('day', 'Not specified')}
+⏰ Time: {event_data.get('time', 'Not specified')}
+📍 Location: {event_data.get('location', 'Not specified')}
+
+Is this correct? Reply 'yes' to confirm or 'no' to fix it! 🎯"""
+        else:
+            return f"""🎙️ I heard: "{transcribed_text}"
+            
+🤔 I couldn't understand the event details. Please include:
+- What activity
+- Which child (if you have multiple)
+- When (day and time)
+
+Try again or type the details! 💫"""
+        
+    except Exception as e:
+        log_structured('ERROR', 'Voice processing error', correlation_id, error=str(e)[:100])
+        return "Could not process voice message. Please try typing your message instead."
+
+def parse_event_from_voice(transcript, phone_number):
+    """Use GPT-4 to parse event details from voice transcript"""
+    try:
+        prompt = f"""Extract event details from this voice message about family scheduling.
+        
+        Voice message: "{transcript}"
+        
+        Extract these details:
+        - activity: What is the event/activity?
+        - child: Which child is this for? (if mentioned)
+        - day: What day? (e.g., Thursday, tomorrow, next Monday)
+        - time: What time? (e.g., 4:30 PM, 3 o'clock)
+        - location: Where? (if mentioned)
+        
+        Return as JSON. If a detail isn't mentioned, use null.
+        
+        Example response:
+        {
+            "activity": "soccer practice",
+            "child": "Emma",
+            "day": "Thursday",
+            "time": "4:30 PM",
+            "location": null
+        }"""
+        
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are an expert at parsing family scheduling information from voice messages."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=200,
+            temperature=0.1
+        )
+        
+        event_data = json.loads(response.choices[0].message.content)
+        log_structured('INFO', 'Event parsed successfully', get_correlation_id(), event=event_data)
+        return event_data
+        
+    except Exception as e:
+        log_structured('ERROR', 'Event parsing failed', get_correlation_id(), error=str(e)[:100])
+        return None
     
 def process_expense_message_with_trips(message_body, phone_number, correlation_id):
     """Enhanced expense processing with trip intelligence"""
