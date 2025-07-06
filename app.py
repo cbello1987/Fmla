@@ -43,7 +43,51 @@ def verify_webhook_signature(request):
     if os.getenv('FLASK_ENV') == 'development':
         return True  # Skip in dev
     return True
+# security.py - NEW FILE
+import os
+import hmac
+import hashlib
+from functools import wraps
+from flask import request, abort
+from twilio.request_validator import RequestValidator
 
+def verify_twilio_webhook(f):
+    """Decorator to verify Twilio webhook signatures"""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        # Skip in development
+        if os.getenv('FLASK_ENV') == 'development':
+            return f(*args, **kwargs)
+            
+        validator = RequestValidator(os.getenv('TWILIO_AUTH_TOKEN'))
+        
+        # Get signature from headers
+        signature = request.headers.get('X-Twilio-Signature', '')
+        
+        # Get the full URL (important for validation)
+        url = request.url
+        
+        # Get POST parameters
+        params = request.form.to_dict()
+        
+        # Validate
+        if not validator.validate(url, params, signature):
+            print("WARNING: Invalid Twilio signature detected!")
+            abort(403)
+            
+        return f(*args, **kwargs)
+    return decorated_function
+
+def sanitize_family_input(text, max_length=500):
+    """Sanitize input for family data"""
+    if not text:
+        return ""
+    
+    # Remove any potential script injections
+    text = text.replace('<', '').replace('>', '')
+    
+    # Limit length
+    return text.strip()[:max_length]
 # =================== REDIS INTEGRATION ===================
 
 def get_redis_client():
@@ -385,50 +429,73 @@ def check_environment():
 # Check environment on startup
 env_ok = check_environment()
 
-# S.V.E.N. Expert System Prompt with Trip Intelligence
-SVEN_PROMPT = """You are S.V.E.N. (Smart Virtual Expense Navigator), an AI expense assistant. 
+# REPLACE the old SVEN_PROMPT with this new family-focused version:
 
-CRITICAL CONSTRAINTS:
-- NEVER create or mention expenses that weren't submitted by the user
-- NEVER make up vendor names, amounts, or transaction details  
-- ONLY analyze actual receipt images or text the user provides
-- If asked about expenses you don't have data for, say "I don't have that information"
-- NEVER mention features that don't exist (like "start new trip" - we only have trip creation via "yes" responses)
+SVEN_FAMILY_PROMPT = """You are S.V.E.N. (Smart Virtual Event Navigator), a warm and efficient family scheduling assistant.
 
-LANGUAGE RULE:
-- Always respond in the SAME LANGUAGE the user writes in
+PERSONALITY:
+- Friendly, helpful, and understanding of busy family life
+- Nordic efficiency meets family warmth
+- Patient with parents who are juggling multiple kids
+- Celebrates small wins in family coordination
 
-RECEIPT ANALYSIS ONLY:
-- Analyze what you can actually see in receipt images
-- Extract: total amount, date, merchant name, items (if visible)
-- Categorize as: meals, lodging, transportation, office, other
-- For hotel receipts: separate room charges from taxes
+CAPABILITIES:
+- Parse voice messages about family events
+- Detect scheduling conflicts
+- Suggest solutions for double-bookings
+- Track multiple children's activities
+- Understand common family activities (soccer, piano, dentist, school)
 
-TRIP INTELLIGENCE:
-- User has one active trip at a time
-- Only mention actual trip data from Redis
-- Trip totals come from real submitted expenses only
+LANGUAGE:
+- Always respond in the user's language
+- Use warm, encouraging tone
+- Include relevant emojis for visual clarity
+- Keep responses concise for busy parents
 
-AVAILABLE FEATURES:
-- Receipt photo analysis
-- Trip creation (when user says "yes")
-- Adding expenses to existing trips
-- Data deletion ("delete my data")
+IMPORTANT:
+- Never make up events or schedules
+- Always confirm before adding to calendar
+- Be sensitive to family stress
+- Celebrate successful scheduling
 
-WHAT YOU CANNOT DO:
-- Create expense lists from memory
-- Start new trips (beyond the "yes" flow)
-- Access historical data not in current session
-- Make up business names or amounts
+End responses with helpful next steps or encouragement.
+Example: "Great job staying organized! 🌟" """
 
-RESPONSE FORMAT:
-- Keep responses under 200 words
-- Always end with: "Need help with more receipts? This is an educational demo only."
-- Use numbered menus only when offering actual choices
+# UPDATE the welcome message function:
+def get_family_welcome():
+    """Get the new family-focused welcome message"""
+    return """👋 Hi! I'm S.V.E.N., your family's planning assistant!
 
-EXAMPLES:
-✅ GOOD: "Hotel receipt shows $189/night room rate plus $23.67 taxes"
-❌ BAD: "Your previous expenses include Nordic Airlines $200..."
+I help busy parents manage:
+📅 Kids' activities & appointments
+🚗 Schedule conflicts before they happen
+⏰ Reminders for important events
+🎯 All through simple voice messages!
+
+To get started, tell me:
+"My kids are [names and ages]"
+
+Example: "My kids are Emma (8) and Jack (6)"
+
+Ready to make family scheduling stress-free? 🌟"""
+
+# UPDATE the webhook handler for numbered responses:
+def handle_menu_choice(choice, correlation_id):
+    """Updated menu for family context"""
+    
+    menu_responses = {
+        '1': "👨‍👩‍👧‍👦 **Let's Set Up Your Family!**\n\nTell me your children's names and ages. For example:\n'My kids are Emma (8) and Jack (6)'\n\nThis helps me track their activities accurately! 🎯",
+        
+        '2': "🎙️ **Voice Scheduling Magic!**\n\nJust send a voice message like:\n• 'Soccer practice moved to Thursday 4:30'\n• 'Dentist appointment for Jack Monday at 3'\n• 'Emma has piano recital next Saturday'\n\nI'll understand and add it to your calendar! ✨",
+        
+        '3': "📱 **How S.V.E.N. Works:**\n\n1. Send voice message → I transcribe it\n2. I show you what I understood\n3. Confirm or edit the details\n4. Synced to your family calendar!\n\nNo more forgotten practices! 🏆",
+        
+        '4': "🧪 **Test Voice Feature!**\n\nTry sending a voice message now:\n'Soccer practice moved to Thursday 4:30'\n\nI'll show you how I process it! 🎯",
+        
+        '5': "💡 **S.V.E.N. Family Tips:**\n\n• Name which child: 'Emma's dance class'\n• Include times: 'Baseball 9am Saturday'\n• I'll detect conflicts automatically\n• Your data is always private & secure\n\nQuestions? Just ask! 💬"
+    }
+    
+    return menu_responses.get(choice, "Please choose 1, 2, 3, 4, or 5! 📋")
 
 Only work with real data the user provides."""
 
@@ -505,6 +572,30 @@ def process_expense_message_with_trips(message_body, phone_number, correlation_i
         else:
             return "❌ Unable to delete data right now. Please try again later."
     
+    def process_expense_message_with_trips(message_body, phone_number, correlation_id):
+    """Enhanced expense processing with trip intelligence"""
+    
+    # Check for data deletion request
+    if "delete my data" in message_body.lower():
+        if delete_user_data(phone_number):
+            return "✅ All your data has been deleted from S.V.E.N. You can start fresh anytime!"
+        else:
+            return "❌ Unable to delete data right now. Please try again later."
+    
+    # ========= ADD THESE NEW LINES HERE =========
+    # Check for family setup
+    if "my kids are" in message_body.lower():
+        return "✅ Great! I'll help you manage your family's schedule. For now, I'm in demo mode. Try sending 'menu' to see options!"
+    
+    # Check for hello/hi
+    if message_body.lower().strip() in ["hi", "hello", "hey"]:
+        return "👋 Hi! I'm S.V.E.N., your family scheduling assistant! I help manage kids' activities. Type 'menu' to get started!"
+    # ========= END OF NEW LINES =========
+    
+    # NEW COMMAND DETECTION (this already exists, don't change)
+    message_lower = message_body.lower().strip()        
+
+
     # NEW COMMAND DETECTION
     message_lower = message_body.lower().strip()
     
