@@ -1,5 +1,6 @@
 from flask import Flask, request, abort
 from twilio.twiml.messaging_response import MessagingResponse
+from twilio.request_validator import RequestValidator
 import openai
 import os
 from dotenv import load_dotenv
@@ -24,6 +25,7 @@ load_dotenv()
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB limit
 
+# Configure OpenAI
 openai.api_key = os.getenv('OPENAI_API_KEY')
 
 # Performance monitoring
@@ -37,87 +39,20 @@ def get_correlation_id():
     """Generate unique request ID for tracing"""
     return str(uuid.uuid4())[:8]
 
-# ... all your imports and other functions ...
-
-
-def create_twiml_response(message, correlation_id=None):
-    resp = MessagingResponse()
-    resp.message(message)
-    return str(resp)
-
-# Error response helper
-def create_error_response(message, correlation_id=None):
-    return create_twiml_response(message, correlation_id)
-
-# Stub for missing handler functions
-def process_voice_message(media_url, from_number, correlation_id):
-    return "Voice message processing is not yet implemented."
-
-def process_receipt_image_with_trips(media_url, media_type, message_body, from_number, correlation_id):
-    return "Receipt image processing is not yet implemented."
-
-def process_expense_message_with_trips(message_body, from_number, correlation_id):
-    return "Expense message processing is not yet implemented."
-
-
-@app.route('/sms', methods=['POST'])
-def sms_webhook():
-    correlation_id = get_correlation_id()
-    global request_start_time
-    request_start_time = time.time()
-    log_structured('INFO', 'SMS webhook triggered', correlation_id)
-    try:
-        if not verify_webhook_signature(request):
-            log_structured('WARN', 'Invalid webhook signature', correlation_id)
-            return 'Forbidden', 403
-        from_number = request.form.get('From', 'UNKNOWN')
-        message_body = sanitize_input(request.form.get('Body', ''))
-        num_media = int(request.form.get('NumMedia', 0))
-        log_structured('INFO', 'Processing message', correlation_id,
-                       from_user=from_number[-4:], media_count=num_media)
-        if not env_ok:
-            return create_error_response(
-                "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄",
-                correlation_id
-            )
-        response_text = ""
-        if message_body.strip() in ['1', '2', '3', '4', '5']:
-            response_text = handle_menu_choice(message_body.strip(), correlation_id)
-        elif request.form.get('MediaContentType0', '').startswith('audio/'):
-            response_text = process_voice_message(
-                request.form.get('MediaUrl0'),
-                from_number,
-                correlation_id
-            )
-        elif num_media > 0:
-            response_text = process_receipt_image_with_trips(
-                request.form.get('MediaUrl0'),
-                request.form.get('MediaContentType0'),
-                message_body,
-                from_number,
-                correlation_id
-            )
-        else:
-            response_text = process_expense_message_with_trips(message_body, from_number, correlation_id)
-        duration = time.time() - request_start_time
-        log_structured('INFO', 'Request completed', correlation_id,
-                       duration_ms=int(duration * 1000))
-    except ValueError as e:
-        log_structured('WARN', 'Input validation error', correlation_id, error=str(e))
-        response_text = "Please check your input and try again."
-    except Exception as e:
-        error_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_structured('ERROR', 'Critical error', correlation_id,
-                       error_id=error_id, error_type=type(e).__name__)
-        response_text = f"Service temporarily unavailable (ID: {error_id})"
-    return create_twiml_response(response_text, correlation_id)
-
-
 def verify_webhook_signature(request):
     """Verify Twilio webhook signature for security"""
     if os.getenv('FLASK_ENV') == 'development':
         return True  # Skip in dev
-    # Add actual verification logic here for production if needed
+    
+    validator = RequestValidator(os.getenv('TWILIO_AUTH_TOKEN'))
+    signature = request.headers.get('X-Twilio-Signature', '')
+    url = request.url
+    params = request.form.to_dict()
+    
+    if not validator.validate(url, params, signature):
+        print("WARNING: Invalid Twilio signature detected!")
+        return False
+    
     return True
 
 def sanitize_family_input(text, max_length=500):
@@ -128,19 +63,22 @@ def sanitize_family_input(text, max_length=500):
     return text.strip()[:max_length]
 
 # =================== REDIS INTEGRATION ===================
+
 def get_redis_client():
     """Get Redis client with secure connection"""
     try:
         redis_url = os.environ.get('REDIS_URL')
         if not redis_url:
             return None
+        
         client = redis.from_url(
             redis_url,
             decode_responses=True,
             socket_connect_timeout=5,
             socket_timeout=5,
-            retry_on_timeout=True
+            retry_on_timeout=True,
         )
+        
         client.ping()
         return client
     except Exception as e:
@@ -159,7 +97,7 @@ def encrypt_sensitive_data(data):
         fernet = Fernet(key)
         return fernet.encrypt(str(data).encode()).decode()
     except:
-        return str(data)  # Fallback to unencrypted if encryption fails
+        return str(data)
 
 def decrypt_sensitive_data(encrypted_data):
     """Decrypt sensitive data"""
@@ -170,197 +108,24 @@ def decrypt_sensitive_data(encrypted_data):
     except:
         return encrypted_data
 
-def create_trip(phone_number, trip_name="Business Trip", business_purpose=""):
-    """Create a new business trip"""
-    redis_client = get_redis_client()
-    if not redis_client:
-        return None
-    try:
-        phone_hash = hash_phone_number(phone_number)
-        trip_id = f"trip_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        trip_data = {
-            "trip_id": trip_id,
-            "name": trip_name,
-            "status": "active",
-            "created_at": datetime.utcnow().isoformat(),
-            "expires_at": (datetime.utcnow() + timedelta(days=7)).isoformat(),
-            "business_purpose": business_purpose,
-            "expenses": [],
-            "totals": {
-                "transportation": 0.0,
-                "lodging": 0.0,
-                "meals": 0.0,
-                "other": 0.0,
-                "total_business": 0.0,
-                "expense_count": 0
-            }
-        }
-        # Store trip data with TTL
-        redis_client.hset(f"user:{phone_hash}:trips", trip_id, json.dumps(trip_data))
-        redis_client.expire(f"user:{phone_hash}:trips", 604800)  # 7 days
-        # Update user profile
-        profile = {
-            "active_trip_id": trip_id,
-            "last_activity": datetime.utcnow().isoformat()
-        }
-        redis_client.hset(f"user:{phone_hash}:profile", mapping=profile)
-        redis_client.expire(f"user:{phone_hash}:profile", 2592000)  # 30 days
-        return trip_data
-    except Exception as e:
-        log_structured('ERROR', 'Trip creation failed', get_correlation_id(), error=str(e)[:100])
-        return None
-
-def add_expense_to_trip(phone_number, expense_data):
-    """Add expense to user's active trip"""
-    redis_client = get_redis_client()
-    if not redis_client:
-        return None
-    try:
-        phone_hash = hash_phone_number(phone_number)
-        profile_data = redis_client.hgetall(f"user:{phone_hash}:profile")
-        if not profile_data or "active_trip_id" not in profile_data:
-            return None
-        active_trip_id = profile_data["active_trip_id"]
-        trip_json = redis_client.hget(f"user:{phone_hash}:trips", active_trip_id)
-        if not trip_json:
-            return None
-        trip_data = json.loads(trip_json)
-        encrypted_expense = {
-            "expense_id": f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            "timestamp": datetime.utcnow().isoformat(),
-            "vendor": encrypt_sensitive_data(expense_data.get("vendor", "")),
-            "amount": encrypt_sensitive_data(expense_data.get("amount", 0)),
-            "category": expense_data.get("category", "other"),
-            "description": expense_data.get("description", ""),
-            "correlation_id": get_correlation_id()
-        }
-        trip_data["expenses"].append(encrypted_expense)
-        amount = float(expense_data.get("amount", 0))
-        category = expense_data.get("category", "other")
-        if category in trip_data["totals"]:
-            trip_data["totals"][category] += amount
-        else:
-            trip_data["totals"]["other"] += amount
-        trip_data["totals"]["total_business"] += amount
-        trip_data["totals"]["expense_count"] += 1
-        redis_client.hset(f"user:{phone_hash}:trips", active_trip_id, json.dumps(trip_data))
-        return trip_data
-    except Exception as e:
-        log_structured('ERROR', 'Add expense failed', get_correlation_id(), error=str(e)[:100])
-        return None
-
-def get_user_trip_summary(phone_number):
-    """Get summary of user's active trip"""
-    redis_client = get_redis_client()
-    if not redis_client:
-        return None
-    try:
-        phone_hash = hash_phone_number(phone_number)
-        profile_data = redis_client.hgetall(f"user:{phone_hash}:profile")
-        if not profile_data or "active_trip_id" not in profile_data:
-            return None
-        active_trip_id = profile_data["active_trip_id"]
-        trip_json = redis_client.hget(f"user:{phone_hash}:trips", active_trip_id)
-        if not trip_json:
-            return None
-        trip_data = json.loads(trip_json)
-        totals = trip_data["totals"]
-        return {
-            "trip_name": trip_data["name"],
-            "expense_count": totals["expense_count"],
-            "total_amount": totals["total_business"],
-            "categories": {
-                "meals": totals["meals"],
-                "lodging": totals["lodging"],
-                "transportation": totals["transportation"],
-                "other": totals["other"]
-            }
-        }
-    except Exception as e:
-        log_structured('ERROR', 'Get trip summary failed', get_correlation_id(), error=str(e)[:100])
-        return None
-
 def delete_user_data(phone_number):
     """Delete all user data - GDPR compliance"""
     redis_client = get_redis_client()
     if not redis_client:
         return False
+    
     try:
         phone_hash = hash_phone_number(phone_number)
         redis_client.delete(f"user:{phone_hash}:profile")
         redis_client.delete(f"user:{phone_hash}:trips")
+        redis_client.delete(f"family:{phone_hash}:profile")
+        redis_client.delete(f"family:{phone_hash}:events")
         return True
     except Exception as e:
         log_structured('ERROR', 'Delete user data failed', get_correlation_id(), error=str(e)[:100])
         return False
 
-def extract_expense_data(message, ai_response):
-    """Extract expense data from message and AI response - ENHANCED VERSION"""
-    try:
-        import re
-        text = message + " " + ai_response
-        amount = 0
-        total_patterns = re.findall(r'(?:total|amount|grand total):\s*\$?(\d+\.?\d*)', text.lower())
-        if total_patterns:
-            amount = float(total_patterns[-1])
-        elif re.search(r'total\s+\$(\d+\.?\d*)', text.lower()):
-            total_match = re.search(r'total\s+\$(\d+\.?\d*)', text.lower())
-            amount = float(total_match.group(1))
-        else:
-            amounts = re.findall(r'\$(\d+\.?\d*)', text)
-            if amounts:
-                float_amounts = [float(a) for a in amounts if float(a) >= 5.0]
-                if float_amounts:
-                    amount = max(float_amounts)
-        if amount == 0 or amount < 1.0:
-            return None
-        text_lower = text.lower()
-        if any(word in text_lower for word in ["hotel", "room", "accommodation", "lodging", "inn", "resort"]):
-            category = "lodging"
-        elif any(word in text_lower for word in ["uber", "taxi", "flight", "parking", "gas", "mileage", "airport", "airline"]):
-            category = "transportation"
-        elif any(word in text_lower for word in ["restaurant", "dinner", "lunch", "coffee", "meal", "food", "bar", "brewing", "cafe"]):
-            category = "meals"
-        elif any(word in text_lower for word in ["office", "supplies", "equipment", "software", "subscription"]):
-            category = "office"
-        else:
-            category = "other"
-        vendor = "Business Expense"
-        merchant_patterns = re.findall(r'(?:merchant|from|at):\s*([A-Za-z][A-Za-z\s&]+?)(?:\s|$|\n)', text)
-        if merchant_patterns:
-            vendor = merchant_patterns[0].strip()
-        else:
-            vendor_patterns = re.findall(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', text)
-            if vendor_patterns:
-                filtered = [v for v in vendor_patterns if v not in ['Date', 'Total', 'Amount', 'Tax', 'Items', 'Payment']]
-                if filtered:
-                    vendor = filtered[0]
-        return {
-            "amount": round(amount, 2),
-            "category": category,
-            "vendor": vendor[:50],
-            "description": message[:100]
-        }
-    except Exception as e:
-        print(f"Extract expense error: {str(e)[:50]}")
-        return None
-
-@lru_cache(maxsize=100)
-def get_cached_response(message_hash):
-    """Cache responses for identical messages"""
-    return response_cache.get(message_hash)
-
-def cache_response(message_hash, response):
-    """Store response in cache with expiry"""
-    response_cache[message_hash] = {
-        'response': response,
-        'timestamp': time.time()
-    }
-    current_time = time.time()
-    expired_keys = [k for k, v in response_cache.items()
-                    if current_time - v['timestamp'] > CACHE_EXPIRY]
-    for key in expired_keys:
-        del response_cache[key]
+# =================== LOGGING ===================
 
 def log_structured(level, message, correlation_id=None, **kwargs):
     timestamp = datetime.now().isoformat()
@@ -373,6 +138,7 @@ def log_structured(level, message, correlation_id=None, **kwargs):
     }
     if 'error' in log_data and len(str(log_data['error'])) > 200:
         log_data['error'] = str(log_data['error'])[:200] + '...'
+    
     print(f"{level} [{correlation_id}] {message} {log_data}")
 
 def sanitize_input(text, max_length=5000):
@@ -383,9 +149,11 @@ def sanitize_input(text, max_length=5000):
         raise ValueError(f"Input too long: {len(text)} chars (max {max_length})")
     return text.strip()[:max_length]
 
+# Environment check on startup
 def check_environment():
     required_vars = ['OPENAI_API_KEY', 'TWILIO_ACCOUNT_SID', 'TWILIO_AUTH_TOKEN']
     missing = [var for var in required_vars if not os.getenv(var)]
+    
     if missing:
         log_structured('ERROR', f"Missing env vars: {missing}")
         return False
@@ -393,7 +161,10 @@ def check_environment():
         log_structured('INFO', "All environment variables loaded")
         return True
 
+# Check environment on startup
 env_ok = check_environment()
+
+# =================== AI PROMPTS ===================
 
 SVEN_FAMILY_PROMPT = """You are S.V.E.N. (Smart Virtual Event Navigator), a warm and efficient family scheduling assistant.
 
@@ -423,58 +194,266 @@ IMPORTANT:
 - Celebrate successful scheduling
 
 End responses with helpful next steps or encouragement.
-
-Example: "Great job staying organized! 🌟"
-"""
+Example: "Great job staying organized! 🌟" """
 
 def get_family_welcome():
     """Get the new family-focused welcome message"""
     return """👋 Hi! I'm S.V.E.N., your family's planning assistant!
+
 I help busy parents manage:
 📅 Kids' activities & appointments
 🚗 Schedule conflicts before they happen
 ⏰ Reminders for important events
 🎯 All through simple voice messages!
+
 To get started, tell me:
 "My kids are [names and ages]"
+
 Example: "My kids are Emma (8) and Jack (6)"
+
 Ready to make family scheduling stress-free? 🌟"""
 
 def handle_menu_choice(choice, correlation_id):
     """Updated menu for family context"""
+    
     menu_responses = {
-        '1': "👨👩👧👦 **Let's Set Up Your Family!**\n\nTell me your children's names and ages. For example:\n'My kids are Emma (8) and Jack (6)'\n\nThis helps me track their activities accurately! 🎯",
-        '2': "🎙️ **Voice Scheduling Magic!**\n\nJust send a voice message like:\n• 'Soccer practice moved to Thursday 4:30'\n• 'Dentist appointment for Jack Monday at 3'\n• 'Emma has piano recital next Saturday'\n\nI'll understand and add it to your calendar! ✨",
+        '1': "👨‍👩‍👧‍👦 **Let's Set Up Your Family!**\n\nTell me your children's names and ages. For example:\n'My kids are Emma (8) and Jack (6)'\n\nThis helps me track their activities accurately! 🎯",
+        
+        '2': "🎙️ **Voice Scheduling Magic!**\n\nJust send a voice message like:\n• 'Soccer practice moved to Thursday 4:30'\n• 'Dentist appointment for Jack Monday at 3'\n• 'Emma has piano recital next Saturday'\n\nI'll transcribe it and show you what I heard! Voice parsing coming next! ✨",
+        
         '3': "📱 **How S.V.E.N. Works:**\n\n1. Send voice message → I transcribe it\n2. I show you what I understood\n3. Confirm or edit the details\n4. Synced to your family calendar!\n\nNo more forgotten practices! 🏆",
+        
         '4': "🧪 **Test Voice Feature!**\n\nTry sending a voice message now:\n'Soccer practice moved to Thursday 4:30'\n\nI'll show you how I process it! 🎯",
+        
         '5': "💡 **S.V.E.N. Family Tips:**\n\n• Name which child: 'Emma's dance class'\n• Include times: 'Baseball 9am Saturday'\n• I'll detect conflicts automatically\n• Your data is always private & secure\n\nQuestions? Just ask! 💬"
     }
+    
     return menu_responses.get(choice, "Please choose 1, 2, 3, 4, or 5! 📋")
 
+# =================== MESSAGE PROCESSING ===================
+
+def process_expense_message_with_trips(message_body, phone_number, correlation_id):
+    """Enhanced expense processing with trip intelligence"""
+    
+    # Check for data deletion request
+    if "delete my data" in message_body.lower():
+        if delete_user_data(phone_number):
+            return "✅ All your data has been deleted from S.V.E.N. You can start fresh anytime!"
+        else:
+            return "❌ Unable to delete data right now. Please try again later."
+    
+    # Check for family setup
+    if "my kids are" in message_body.lower():
+        return "✅ Great! I'll help you manage your family's schedule. For now, I'm in demo mode. Try sending 'menu' to see options!"
+    
+    # Check for hello/hi
+    if message_body.lower().strip() in ["hi", "hello", "hey"]:
+        return "👋 Hi! I'm S.V.E.N., your family scheduling assistant! I help manage kids' activities. Type 'menu' to get started!"
+    
+    # Menu command - exact match to avoid confusion
+    message_lower = message_body.lower().strip()
+    if message_lower == "menu" or message_lower == "help":
+        return """I'm S.V.E.N., your Smart Virtual Event Navigator! 📅✨
+
+Choose what you'd like to do:
+1️⃣ Set up your family
+2️⃣ Learn about voice features  
+3️⃣ How S.V.E.N. works
+4️⃣ Test voice message
+5️⃣ Ask a question
+
+Reply with 1, 2, 3, 4, or 5. This is a demo - voice transcription working!"""
+    
+    # For now, pass any other message to the AI
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": SVEN_FAMILY_PROMPT},
+                {"role": "user", "content": message_body}
+            ],
+            max_tokens=600,
+            temperature=0.5,
+            timeout=12
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        log_structured('ERROR', 'OpenAI error', correlation_id, error=str(e)[:100])
+        return "Sorry, I couldn't process that. Please try again!"
+
+def process_voice_message(audio_url, phone_number, correlation_id):
+    """Process voice messages for family scheduling"""
+    log_structured('INFO', 'Voice message received', correlation_id)
+    
+    try:
+        # Download audio from Twilio
+        twilio_sid = os.getenv('TWILIO_ACCOUNT_SID')
+        twilio_token = os.getenv('TWILIO_AUTH_TOKEN')
+        
+        response = requests.get(audio_url, auth=(twilio_sid, twilio_token), timeout=10)
+        
+        if response.status_code != 200:
+            log_structured('WARN', 'Audio download failed', correlation_id, status=response.status_code)
+            return "Could not download voice message. Please try again."
+        
+        # Save audio temporarily
+        audio_data = io.BytesIO(response.content)
+        audio_data.name = "voice_message.ogg"
+        
+        # Transcribe with Whisper
+        log_structured('INFO', 'Transcribing with Whisper', correlation_id)
+        
+        transcript = openai.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_data,
+            language="en"
+        )
+        
+        transcribed_text = transcript.text
+        log_structured('INFO', 'Transcription complete', correlation_id, text=transcribed_text[:50])
+        
+        # Parse the event using GPT-4
+        event_data = parse_event_from_voice(transcribed_text, phone_number)
+        
+        if event_data:
+            # Format the parsed data nicely
+            return f"""🎙️ I heard: "{transcribed_text}"
+
+✅ I understood:
+⚽ Activity: {event_data.get('activity', 'Unknown')}
+👶 Child: {event_data.get('child', 'Not specified')}
+📅 Day: {event_data.get('day', 'Not specified')}
+⏰ Time: {event_data.get('time', 'Not specified')}
+📍 Location: {event_data.get('location', 'Not specified')}
+
+Is this correct? Reply 'yes' to confirm or 'no' to fix it! 🎯"""
+        else:
+            return f"""🎙️ I heard: "{transcribed_text}"
+            
+🤔 I couldn't understand the event details. Please include:
+- What activity
+- Which child (if you have multiple)
+- When (day and time)
+
+Try again or type the details! 💫"""
+        
+    except Exception as e:
+        log_structured('ERROR', 'Voice processing error', correlation_id, error=str(e)[:100])
+        return "Could not process voice message. Please try typing your message instead."
+
+def parse_event_from_voice(transcript, phone_number):
+    """Use GPT-4 to parse event details from voice transcript"""
+    try:
+        # Add debug log
+        log_structured('INFO', 'Starting event parse', get_correlation_id(), transcript=transcript)
+        
+        prompt = f"""Extract event details from this voice message about family scheduling.
+        
+        Voice message: "{transcript}"
+        
+        Extract these details:
+        - activity: What is the event/activity?
+        - child: Which child is this for? (if mentioned)
+        - day: What day? (e.g., Thursday, tomorrow, Monday, every Monday)
+        - time: What time? (e.g., 4:30 PM, 3 o'clock, 7 a.m.)
+        - location: Where? (if mentioned)
+        - recurring: Is this recurring? (e.g., every Monday)
+        
+        Return ONLY valid JSON, nothing else.
+        
+        Example: "piano lessons for Andy at 7 a.m. every Monday" should return:
+        {{"activity": "piano lessons", "child": "Andy", "day": "Monday", "time": "7:00 AM", "location": null, "recurring": "every Monday"}}"""
+        
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a JSON-only responder. Return ONLY valid JSON, no other text."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=200,
+            temperature=0.1
+        )
+        
+        # Get the response text
+        response_text = response.choices[0].message.content.strip()
+        
+        # Try to parse the response
+        try:
+            event_data = json.loads(response_text)
+            log_structured('INFO', 'Event parsed successfully', get_correlation_id(), event=event_data)
+            return event_data
+        except json.JSONDecodeError as je:
+            log_structured('ERROR', 'JSON parse failed', get_correlation_id(), 
+                          response=response_text[:200], json_error=str(je))
+            return None
+        
+    except Exception as e:
+        log_structured('ERROR', 'Event parsing failed', get_correlation_id(), error=str(e)[:100])
+        return None
+
+def process_receipt_image_with_trips(media_url, content_type, message_body, phone_number, correlation_id):
+    """Process receipt images"""
+    return "Receipt processing is being upgraded to support family events. For now, try voice messages! 🎙️"
+
+# =================== RESPONSE HELPERS ===================
+
+def create_twiml_response(message, correlation_id):
+    """Create Twilio response with correlation tracking"""
+    try:
+        twiml_response = MessagingResponse()
+        twiml_response.message(message)
+        log_structured('INFO', 'Response sent', correlation_id, length=len(message))
+        return str(twiml_response)
+    except Exception as e:
+        log_structured('ERROR', 'TwiML error', correlation_id, error=str(e))
+        fallback = MessagingResponse()
+        fallback.message("Service error occurred")
+        return str(fallback)
+
+def create_error_response(message, correlation_id):
+    """Create standardized error response"""
+    log_structured('WARN', 'Error response', correlation_id, message=message)
+    return create_twiml_response(message, correlation_id)
+
 # =================== WEBHOOK HANDLERS ===================
+
 @app.route('/sms', methods=['POST'])
 def sms_webhook():
     correlation_id = get_correlation_id()
     global request_start_time
     request_start_time = time.time()
+    
     log_structured('INFO', 'SMS webhook triggered', correlation_id)
+    
     try:
+        # Security: Verify webhook signature
         if not verify_webhook_signature(request):
             log_structured('WARN', 'Invalid webhook signature', correlation_id)
             return 'Forbidden', 403
+        
+        # Extract and validate input
         from_number = request.form.get('From', 'UNKNOWN')
         message_body = sanitize_input(request.form.get('Body', ''))
         num_media = int(request.form.get('NumMedia', 0))
-        log_structured('INFO', 'Processing message', correlation_id,
-                       from_user=from_number[-4:], media_count=num_media)
+
+        log_structured('INFO', 'Processing message', correlation_id, 
+                      from_user=from_number[-4:], media_count=num_media)
+        
+        # Environment check with graceful degradation
         if not env_ok:
             return create_error_response(
-                "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄",
+                "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄", 
                 correlation_id
             )
+        
         response_text = ""
+        
+        # Handle numbered menu responses (fast path - no AI calls)
         if message_body.strip() in ['1', '2', '3', '4', '5']:
             response_text = handle_menu_choice(message_body.strip(), correlation_id)
+        # Check for voice messages
         elif request.form.get('MediaContentType0', '').startswith('audio/'):
             response_text = process_voice_message(
                 request.form.get('MediaUrl0'),
@@ -483,32 +462,36 @@ def sms_webhook():
             )
         elif num_media > 0:
             response_text = process_receipt_image_with_trips(
-                request.form.get('MediaUrl0'),
+                request.form.get('MediaUrl0'), 
                 request.form.get('MediaContentType0'),
-                message_body,
+                message_body, 
                 from_number,
                 correlation_id
             )
         else:
             response_text = process_expense_message_with_trips(message_body, from_number, correlation_id)
+        
+        # Log performance metrics
         duration = time.time() - request_start_time
-        log_structured('INFO', 'Request completed', correlation_id,
-                       duration_ms=int(duration * 1000))
+        log_structured('INFO', 'Request completed', correlation_id, 
+                      duration_ms=int(duration * 1000))
+            
     except ValueError as e:
         log_structured('WARN', 'Input validation error', correlation_id, error=str(e))
         response_text = "Please check your input and try again."
     except Exception as e:
         error_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_structured('ERROR', 'Critical error', correlation_id,
-                       error_id=error_id, error_type=type(e).__name__)
+        log_structured('ERROR', 'Critical error', correlation_id, 
+                      error_id=error_id, error_type=type(e).__name__)
         response_text = f"Service temporarily unavailable (ID: {error_id})"
+    
     return create_twiml_response(response_text, correlation_id)
 
-# ... (Other functions such as process_voice_message, process_receipt_image_with_trips, process_expense_message_with_trips, etc., should be included here as in your original code, with proper indentation and closure.)
+# =================== STATUS ENDPOINTS ===================
 
 @app.route('/', methods=['GET'])
 def home():
-    return "S.V.E.N. (Smart Virtual Expense Navigator) with Trip Intelligence is running! 🤖 Text +18775374013 to start managing expenses!", 200
+    return "S.V.E.N. (Smart Virtual Event Navigator) is running! 🤖 Text +18775374013 to start!", 200
 
 @app.route('/ping', methods=['GET'])
 def ping():
@@ -525,6 +508,8 @@ def health_check():
         'cache_size': len(response_cache),
         'memory_usage': f"{len(str(response_cache)) / 1024:.1f}KB"
     }
+    
+    # Test Redis connectivity
     try:
         redis_client = get_redis_client()
         if redis_client:
@@ -533,6 +518,8 @@ def health_check():
             health_data['redis_status'] = 'disconnected'
     except:
         health_data['redis_status'] = 'error'
+    
+    # Test OpenAI connectivity
     try:
         if not openai.api_key:
             health_data['openai_status'] = 'no_key'
@@ -540,6 +527,7 @@ def health_check():
             health_data['openai_status'] = 'ready'
     except:
         health_data['openai_status'] = 'error'
+    
     status_code = 200 if env_ok else 503
     return health_data, status_code
 
@@ -548,14 +536,17 @@ def debug_info():
     """Debug endpoint - RESTRICT IN PRODUCTION"""
     if os.getenv('FLASK_ENV') != 'development':
         return "Debug endpoint disabled in production", 404
+    
     debug_data = {
         'timestamp': datetime.now().isoformat(),
         'environment_ok': env_ok,
         'openai_key_present': bool(os.getenv('OPENAI_API_KEY')),
         'twilio_sid_present': bool(os.getenv('TWILIO_ACCOUNT_SID')),
         'redis_url_present': bool(os.getenv('REDIS_URL')),
-        'flask_app': 'S.V.E.N. v2.0 with Redis Trip Intelligence'
+        'flask_app': 'S.V.E.N. v2.0 Family Assistant'
     }
+    
+    # Test Redis connection in debug
     try:
         redis_client = get_redis_client()
         if redis_client:
@@ -565,8 +556,9 @@ def debug_info():
             debug_data['redis_test'] = 'failed'
     except Exception as e:
         debug_data['redis_test'] = f'error: {str(e)[:50]}'
+    
     return debug_data, 200
 
 if __name__ == '__main__':
-    log_structured('INFO', "S.V.E.N. with Trip Intelligence starting up")
+    log_structured('INFO', "S.V.E.N. Family Assistant starting up")
     app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
