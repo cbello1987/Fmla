@@ -284,64 +284,22 @@ Reply with 1, 2, 3, 4, or 5. This is a demo - voice transcription working!"""
         return "Sorry, I couldn't process that. Please try again!"
 
 def process_voice_message(audio_url, phone_number, correlation_id):
-    """Process voice messages for family scheduling"""
-    log_structured('INFO', 'Voice message received', correlation_id)
-    
+    """Process voice messages and convert to text for event extraction"""
     try:
-        # Download audio from Twilio
-        twilio_sid = os.getenv('TWILIO_ACCOUNT_SID')
-        twilio_token = os.getenv('TWILIO_AUTH_TOKEN')
-        
-        response = requests.get(audio_url, auth=(twilio_sid, twilio_token), timeout=10)
-        
-        if response.status_code != 200:
-            log_structured('WARN', 'Audio download failed', correlation_id, status=response.status_code)
-            return "Could not download voice message. Please try again."
-        
-        # Save audio temporarily
-        audio_data = io.BytesIO(response.content)
-        audio_data.name = "voice_message.ogg"
-        
-        # Transcribe with Whisper
-        log_structured('INFO', 'Transcribing with Whisper', correlation_id)
-        
-        transcript = openai.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_data,
-            language="en"
-        )
-        
-        transcribed_text = transcript.text
-        log_structured('INFO', 'Transcription complete', correlation_id, text=transcribed_text[:50])
-        
-        # Parse the event using GPT-4
-        event_data = parse_event_from_voice(transcribed_text, phone_number)
-        
-        if event_data:
-            # Format the parsed data nicely
-            return f"""🎙️ I heard: "{transcribed_text}"
+        # Download the audio file
+        audio_response = requests.get(audio_url)
+        if audio_response.status_code != 200:
+            log_structured('ERROR', 'Audio download failed', correlation_id)
+            return "Sorry, I couldn't access the voice message. Please try again! 🎤"
 
-✅ I understood:
-⚽ Activity: {event_data.get('activity', 'Unknown')}
-👶 Child: {event_data.get('child', 'Not specified')}
-📅 Day: {event_data.get('day', 'Not specified')}
-⏰ Time: {event_data.get('time', 'Not specified')}
-📍 Location: {event_data.get('location', 'Not specified')}
+        # TODO: Implement speech-to-text conversion using OpenAI Whisper API
+        # For now, return a friendly message
+        return ("I heard your voice message! 🎤 While I'm learning to understand speech better, "
+                "please type your event details or try the menu options (1-5)! 📝")
 
-Is this correct? Reply 'yes' to confirm or 'no' to fix it! 🎯"""
-        else:
-            return f"""🎙️ I heard: "{transcribed_text}"
-            
-🤔 I couldn't understand the event details. Please include:
-- What activity
-- Which child (if you have multiple)
-- When (day and time)
-
-Try again or type the details! 💫"""
-        
     except Exception as e:
-        log_structured('ERROR', 'Voice processing error', correlation_id, error=str(e)[:100])
-        return "Could not process voice message. Please try typing your message instead."
+        log_structured('ERROR', 'Voice processing failed', correlation_id, error=str(e))
+        return "Sorry, I had trouble with that voice message. Please try again! 🎤"
 
 def parse_event_from_voice(transcript, phone_number):
     """Use GPT-4 to parse event details from voice transcript"""
@@ -444,7 +402,7 @@ def sms_webhook():
         # Environment check with graceful degradation
         if not env_ok:
             return create_error_response(
-                "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄", 
+                "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄",
                 correlation_id
             )
         
@@ -453,7 +411,6 @@ def sms_webhook():
         # Handle numbered menu responses (fast path - no AI calls)
         if message_body.strip() in ['1', '2', '3', '4', '5']:
             response_text = handle_menu_choice(message_body.strip(), correlation_id)
-        # Check for voice messages
         elif request.form.get('MediaContentType0', '').startswith('audio/'):
             response_text = process_voice_message(
                 request.form.get('MediaUrl0'),
@@ -462,14 +419,19 @@ def sms_webhook():
             )
         elif num_media > 0:
             response_text = process_receipt_image_with_trips(
-                request.form.get('MediaUrl0'), 
+                request.form.get('MediaUrl0'),
                 request.form.get('MediaContentType0'),
-                message_body, 
+                message_body,
                 from_number,
                 correlation_id
             )
         else:
-            response_text = process_expense_message_with_trips(message_body, from_number, correlation_id)
+            # Process text messages for family events
+            response_text = process_expense_message_with_trips(
+                message_body, 
+                from_number,
+                correlation_id
+            )
         
         # Log performance metrics
         duration = time.time() - request_start_time
