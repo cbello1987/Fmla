@@ -571,65 +571,55 @@ def sms_webhook():
     
     return create_twiml_response(response_text, correlation_id)
 
-def process_voice_message(audio_url, phone_number, correlation_id):
-    """Process voice messages for family scheduling"""
-    log_structured('INFO', 'Voice message received', correlation_id)
-    
+def parse_event_from_voice(transcript, phone_number):
+    """Use GPT-4 to parse event details from voice transcript"""
     try:
-        # Download audio from Twilio
-        twilio_sid = os.getenv('TWILIO_ACCOUNT_SID')
-        twilio_token = os.getenv('TWILIO_AUTH_TOKEN')
+        # Add debug log
+        log_structured('INFO', 'Starting event parse', get_correlation_id(), transcript=transcript)
         
-        response = requests.get(audio_url, auth=(twilio_sid, twilio_token), timeout=10)
+        prompt = f"""Extract event details from this voice message about family scheduling.
         
-        if response.status_code != 200:
-            log_structured('WARN', 'Audio download failed', correlation_id, status=response.status_code)
-            return "Could not download voice message. Please try again."
+        Voice message: "{transcript}"
         
-        # Save audio temporarily
-        audio_data = io.BytesIO(response.content)
-        audio_data.name = "voice_message.ogg"
+        Extract these details:
+        - activity: What is the event/activity?
+        - child: Which child is this for? (if mentioned)
+        - day: What day? (e.g., Thursday, tomorrow, Monday, every Monday)
+        - time: What time? (e.g., 4:30 PM, 3 o'clock, 7 a.m.)
+        - location: Where? (if mentioned)
+        - recurring: Is this recurring? (e.g., every Monday)
         
-        # Transcribe with Whisper
-        log_structured('INFO', 'Transcribing with Whisper', correlation_id)
+        Return ONLY valid JSON, nothing else.
         
-        transcript = openai.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_data,
-            language="en"
+        Example: "piano lessons for Andy at 7 a.m. every Monday" should return:
+        {{"activity": "piano lessons", "child": "Andy", "day": "Monday", "time": "7:00 AM", "location": null, "recurring": "every Monday"}}"""
+        
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "You are a JSON-only responder. Return ONLY valid JSON, no other text."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=200,
+            temperature=0.1
         )
         
-        transcribed_text = transcript.text
-        log_structured('INFO', 'Transcription complete', correlation_id, text=transcribed_text[:50])
+        # Get the response text
+        response_text = response.choices[0].message.content.strip()
         
-        # Parse the event using GPT-4
-        event_data = parse_event_from_voice(transcribed_text, phone_number)
-        
-        if event_data:
-            # Format the parsed data nicely
-            return f"""🎙️ I heard: "{transcribed_text}"
-
-✅ I understood:
-⚽ Activity: {event_data.get('activity', 'Unknown')}
-👶 Child: {event_data.get('child', 'Not specified')}
-📅 Day: {event_data.get('day', 'Not specified')}
-⏰ Time: {event_data.get('time', 'Not specified')}
-📍 Location: {event_data.get('location', 'Not specified')}
-
-Is this correct? Reply 'yes' to confirm or 'no' to fix it! 🎯"""
-        else:
-            return f"""🎙️ I heard: "{transcribed_text}"
-            
-🤔 I couldn't understand the event details. Please include:
-- What activity
-- Which child (if you have multiple)
-- When (day and time)
-
-Try again or type the details! 💫"""
+        # Try to parse the response
+        try:
+            event_data = json.loads(response_text)
+            log_structured('INFO', 'Event parsed successfully', get_correlation_id(), event=event_data)
+            return event_data
+        except json.JSONDecodeError as je:
+            log_structured('ERROR', 'JSON parse failed', get_correlation_id(), 
+                          response=response_text[:200], json_error=str(je))
+            return None
         
     except Exception as e:
-        log_structured('ERROR', 'Voice processing error', correlation_id, error=str(e)[:100])
-        return "Could not process voice message. Please try typing your message instead."
+        log_structured('ERROR', 'Event parsing failed', get_correlation_id(), error=str(e)[:100])
+        return None
 
 def parse_event_from_voice(transcript, phone_number):
     """Use GPT-4 to parse event details from voice transcript"""
