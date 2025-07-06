@@ -564,7 +564,7 @@ def sms_webhook():
 
 
     
-    def process_expense_message_with_trips(message_body, phone_number, correlation_id):
+def process_expense_message_with_trips(message_body, phone_number, correlation_id):
     """Enhanced expense processing with trip intelligence"""
     
     # Check for data deletion request
@@ -680,7 +680,7 @@ Need help with more receipts? This is an educational demo only."""
         response = openai.chat.completions.create(
             model="gpt-4",
             messages=[
-                {"role": "system", "content": SVEN_PROMPT + context},
+                {"role": "system", "content": SVEN_FAMILY_PROMPT + context},
                 {"role": "user", "content": message_body}
             ],
             max_tokens=600,
@@ -750,7 +750,7 @@ def process_receipt_image_with_trips(media_url, content_type, message_body, phon
         openai_response = openai.chat.completions.create(
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": SVEN_PROMPT + context},
+                {"role": "system", "content": SVEN_FAMILY_PROMPT + context},
                 {"role": "user", "content": [
                     {"type": "text", "text": "Analyze this receipt"},
                     {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}}
