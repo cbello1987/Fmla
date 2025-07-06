@@ -18,6 +18,9 @@ import time
 import redis
 import json
 from cryptography.fernet import Fernet
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # Load environment variables
 load_dotenv()
@@ -87,13 +90,14 @@ def get_redis_client():
 
 def hash_phone_number(phone):
     """Hash phone number for privacy"""
-    salt = "sven_expense_salt_2025"  # In production, use environment variable
+    salt = os.getenv('PHONE_HASH_SALT', 'sven_family_salt_2025')
     return hashlib.sha256((phone + salt).encode()).hexdigest()[:16]
 
 def encrypt_sensitive_data(data):
     """Encrypt sensitive data like amounts and vendors"""
     try:
-        key = base64.urlsafe_b64encode(b"sven_encryption_key_32_chars___")
+        key_string = os.getenv('ENCRYPTION_KEY', 'sven_encryption_key_32_chars___').encode()
+        key = base64.urlsafe_b64encode(key_string[:32].ljust(32, b'0'))
         fernet = Fernet(key)
         return fernet.encrypt(str(data).encode()).decode()
     except:
@@ -102,7 +106,8 @@ def encrypt_sensitive_data(data):
 def decrypt_sensitive_data(encrypted_data):
     """Decrypt sensitive data"""
     try:
-        key = base64.urlsafe_b64encode(b"sven_encryption_key_32_chars___")
+        key_string = os.getenv('ENCRYPTION_KEY', 'sven_encryption_key_32_chars___').encode()
+        key = base64.urlsafe_b64encode(key_string[:32].ljust(32, b'0'))
         fernet = Fernet(key)
         return fernet.decrypt(encrypted_data.encode()).decode()
     except:
@@ -120,10 +125,53 @@ def delete_user_data(phone_number):
         redis_client.delete(f"user:{phone_hash}:trips")
         redis_client.delete(f"family:{phone_hash}:profile")
         redis_client.delete(f"family:{phone_hash}:events")
+        redis_client.delete(f"pending:{phone_hash}")
         return True
     except Exception as e:
         log_structured('ERROR', 'Delete user data failed', get_correlation_id(), error=str(e)[:100])
         return False
+
+def store_pending_event(phone_number, event_data, correlation_id):
+    """Store event data temporarily for confirmation"""
+    redis_client = get_redis_client()
+    if not redis_client:
+        return
+    
+    try:
+        phone_hash = hash_phone_number(phone_number)
+        key = f"pending:{phone_hash}"
+        redis_client.setex(key, 300, json.dumps(event_data))  # 5 minute expiry
+        log_structured('INFO', 'Stored pending event', correlation_id)
+    except Exception as e:
+        log_structured('ERROR', 'Failed to store pending event', correlation_id, error=str(e))
+
+def get_pending_event(phone_number):
+    """Get pending event awaiting confirmation"""
+    redis_client = get_redis_client()
+    if not redis_client:
+        return None
+    
+    try:
+        phone_hash = hash_phone_number(phone_number)
+        key = f"pending:{phone_hash}"
+        data = redis_client.get(key)
+        return json.loads(data) if data else None
+    except Exception as e:
+        log_structured('ERROR', 'Failed to get pending event', get_correlation_id(), error=str(e))
+        return None
+
+def clear_pending_event(phone_number):
+    """Clear pending event after confirmation"""
+    redis_client = get_redis_client()
+    if not redis_client:
+        return
+    
+    try:
+        phone_hash = hash_phone_number(phone_number)
+        key = f"pending:{phone_hash}"
+        redis_client.delete(key)
+    except:
+        pass
 
 # =================== LOGGING ===================
 
@@ -219,7 +267,7 @@ def handle_menu_choice(choice, correlation_id):
     menu_responses = {
         '1': "👨‍👩‍👧‍👦 **Let's Set Up Your Family!**\n\nTell me your children's names and ages. For example:\n'My kids are Emma (8) and Jack (6)'\n\nThis helps me track their activities accurately! 🎯",
         
-        '2': "🎙️ **Voice Scheduling Magic!**\n\nJust send a voice message like:\n• 'Soccer practice moved to Thursday 4:30'\n• 'Dentist appointment for Jack Monday at 3'\n• 'Emma has piano recital next Saturday'\n\nI'll transcribe it and show you what I heard! Voice parsing coming next! ✨",
+        '2': "🎙️ **Voice Scheduling Magic!**\n\nJust send a voice message like:\n• 'Soccer practice moved to Thursday 4:30'\n• 'Dentist appointment for Jack Monday at 3'\n• 'Emma has piano recital next Saturday'\n\nI'll transcribe it and add to your calendar! ✨",
         
         '3': "📱 **How S.V.E.N. Works:**\n\n1. Send voice message → I transcribe it\n2. I show you what I understood\n3. Confirm or edit the details\n4. Synced to your family calendar!\n\nNo more forgotten practices! 🏆",
         
@@ -230,10 +278,77 @@ def handle_menu_choice(choice, correlation_id):
     
     return menu_responses.get(choice, "Please choose 1, 2, 3, 4, or 5! 📋")
 
+# =================== SKYLIGHT INTEGRATION ===================
+
+def send_to_skylight(event_data, phone_number, correlation_id):
+    """Send event to Skylight via email"""
+    try:
+        # Get user's Skylight email (for MVP, use env var)
+        skylight_email = os.getenv('SKYLIGHT_EMAIL', 'your-calendar@skylight.frame')
+        
+        # Format the event for Skylight
+        subject = f"F.A.M. Calendar Update: {event_data.get('activity', 'Event')}"
+        
+        # Build email body
+        body = f"""Event: {event_data.get('activity', 'Family Event')}
+Date: {event_data.get('day', 'Today')}
+Time: {event_data.get('time', 'TBD')}"""
+        
+        if event_data.get('child'):
+            body += f"\nFor: {event_data.get('child')}"
+        
+        if event_data.get('location'):
+            body += f"\nLocation: {event_data.get('location')}"
+        
+        if event_data.get('recurring'):
+            body += f"\nRecurring: {event_data.get('recurring')}"
+        
+        body += "\n\nAdded by: F.A.M. via WhatsApp"
+        
+        # Send email
+        msg = MIMEMultipart()
+        msg['From'] = os.getenv('SMTP_FROM', 'fam@yourdomain.com')
+        msg['To'] = skylight_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        
+        # SMTP configuration (use Gmail or your provider)
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(
+            os.getenv('SMTP_USER'), 
+            os.getenv('SMTP_PASS')
+        )
+        
+        server.send_message(msg)
+        server.quit()
+        
+        log_structured('INFO', 'Sent to Skylight', correlation_id, event=event_data)
+        return True
+        
+    except Exception as e:
+        log_structured('ERROR', 'Skylight send failed', correlation_id, error=str(e)[:200])
+        return False
+
 # =================== MESSAGE PROCESSING ===================
 
 def process_expense_message_with_trips(message_body, phone_number, correlation_id):
     """Enhanced expense processing with trip intelligence"""
+    
+    # Check for confirmation
+    if message_body.lower().strip() == "yes":
+        pending_event = get_pending_event(phone_number)
+        if pending_event:
+            # Send to Skylight!
+            success = send_to_skylight(pending_event, phone_number, correlation_id)
+            if success:
+                # Clear pending event
+                clear_pending_event(phone_number)
+                return "✅ Event added to your Skylight calendar! You'll see it in ~30 seconds. 📺"
+            else:
+                return "❌ Sorry, I couldn't add that to Skylight. Please try again!"
+        else:
+            return "🤔 I don't have any pending events to confirm. Try sending a voice message!"
     
     # Check for data deletion request
     if "delete my data" in message_body.lower():
@@ -244,7 +359,7 @@ def process_expense_message_with_trips(message_body, phone_number, correlation_i
     
     # Check for family setup
     if "my kids are" in message_body.lower():
-        return "✅ Great! I'll help you manage your family's schedule. For now, I'm in demo mode. Try sending 'menu' to see options!"
+        return "✅ Great! I'll help you manage your family's schedule. Send a voice message with an event to try it out! 🎤"
     
     # Check for hello/hi
     if message_body.lower().strip() in ["hi", "hello", "hey"]:
@@ -262,9 +377,9 @@ Choose what you'd like to do:
 4️⃣ Test voice message
 5️⃣ Ask a question
 
-Reply with 1, 2, 3, 4, or 5. This is a demo - voice transcription working!"""
+Reply with 1, 2, 3, 4, or 5."""
     
-    # For now, pass any other message to the AI
+    # For any other message, pass to the AI
     try:
         response = openai.chat.completions.create(
             model="gpt-4",
@@ -286,20 +401,72 @@ Reply with 1, 2, 3, 4, or 5. This is a demo - voice transcription working!"""
 def process_voice_message(audio_url, phone_number, correlation_id):
     """Process voice messages and convert to text for event extraction"""
     try:
-        # Download the audio file
-        audio_response = requests.get(audio_url)
+        # Download the audio file with auth
+        auth = (os.getenv('TWILIO_ACCOUNT_SID'), os.getenv('TWILIO_AUTH_TOKEN'))
+        audio_response = requests.get(audio_url, auth=auth, timeout=10)
+        
         if audio_response.status_code != 200:
-            log_structured('ERROR', 'Audio download failed', correlation_id)
+            log_structured('ERROR', 'Audio download failed', correlation_id, status=audio_response.status_code)
             return "Sorry, I couldn't access the voice message. Please try again! 🎤"
 
-        # TODO: Implement speech-to-text conversion using OpenAI Whisper API
-        # For now, return a friendly message
-        return ("I heard your voice message! 🎤 While I'm learning to understand speech better, "
-                "please type your event details or try the menu options (1-5)! 📝")
-
+        # Save audio temporarily
+        temp_path = f"/tmp/audio_{correlation_id}.ogg"
+        with open(temp_path, "wb") as f:
+            f.write(audio_response.content)
+        
+        # Transcribe with Whisper
+        with open(temp_path, "rb") as audio_file:
+            transcript = openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file
+            )
+        
+        log_structured('INFO', 'Voice transcribed', correlation_id, text=transcript.text[:100])
+        
+        # Parse the event from transcript
+        event_data = parse_event_from_voice(transcript.text, phone_number)
+        
+        if event_data:
+            # Format confirmation message
+            confirmation = f"🎤 I heard: \"{transcript.text}\"\n\n"
+            confirmation += "📅 Event details:\n"
+            confirmation += f"• Activity: {event_data.get('activity', 'Unknown')}\n"
+            
+            if event_data.get('child'):
+                confirmation += f"• Child: {event_data.get('child')}\n"
+            
+            confirmation += f"• Day: {event_data.get('day', 'Not specified')}\n"
+            confirmation += f"• Time: {event_data.get('time', 'Not specified')}\n"
+            
+            if event_data.get('location'):
+                confirmation += f"• Location: {event_data.get('location')}\n"
+            
+            if event_data.get('recurring'):
+                confirmation += f"• Recurring: {event_data.get('recurring')}\n"
+            
+            confirmation += "\n✅ Reply 'yes' to add to calendar or tell me what to change!"
+            
+            # Store event data temporarily in Redis for confirmation
+            store_pending_event(phone_number, event_data, correlation_id)
+            
+            return confirmation
+        else:
+            return (f"🎤 I heard: \"{transcript.text}\"\n\n"
+                   "🤔 I couldn't understand the event details. Please try saying:\n"
+                   "• 'Soccer practice Thursday at 4:30'\n"
+                   "• 'Emma has piano Monday 3pm'\n"
+                   "• 'Dentist for Jack tomorrow at 2'")
+            
     except Exception as e:
-        log_structured('ERROR', 'Voice processing failed', correlation_id, error=str(e))
+        log_structured('ERROR', 'Voice processing failed', correlation_id, error=str(e)[:200])
         return "Sorry, I had trouble with that voice message. Please try again! 🎤"
+    finally:
+        # Clean up temp file
+        try:
+            if 'temp_path' in locals():
+                os.remove(temp_path)
+        except:
+            pass
 
 def parse_event_from_voice(transcript, phone_number):
     """Use GPT-4 to parse event details from voice transcript"""
@@ -353,7 +520,7 @@ def parse_event_from_voice(transcript, phone_number):
 
 def process_receipt_image_with_trips(media_url, content_type, message_body, phone_number, correlation_id):
     """Process receipt images"""
-    return "Receipt processing is being upgraded to support family events. For now, try voice messages! 🎙️"
+    return "📸 Photo received! For voice scheduling, please send a voice message instead! 🎤"
 
 # =================== RESPONSE HELPERS ===================
 
@@ -399,7 +566,7 @@ def sms_webhook():
         log_structured('INFO', 'Processing message', correlation_id, 
                       from_user=from_number[-4:], media_count=num_media)
         
-        # Environment check with graceful degradation
+        # Environment check
         if not env_ok:
             return create_error_response(
                 "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄",
@@ -408,46 +575,43 @@ def sms_webhook():
         
         response_text = ""
         
-        # Handle numbered menu responses (fast path - no AI calls)
+        # Handle numbered menu responses
         if message_body.strip() in ['1', '2', '3', '4', '5']:
             response_text = handle_menu_choice(message_body.strip(), correlation_id)
-        elif request.form.get('MediaContentType0', '').startswith('audio/'):
+        
+        # Handle voice messages
+        elif num_media > 0 and request.form.get('MediaContentType0', '').startswith('audio/'):
             response_text = process_voice_message(
                 request.form.get('MediaUrl0'),
                 from_number,
                 correlation_id
             )
+        
+        # Handle images
         elif num_media > 0:
-            response_text = process_receipt_image_with_trips(
-                request.form.get('MediaUrl0'),
-                request.form.get('MediaContentType0'),
-                message_body,
-                from_number,
-                correlation_id
-            )
+            response_text = "📸 Photo received! For voice scheduling, please send a voice message instead! 🎤"
+        
+        # Handle text messages
         else:
-            # Process text messages for family events
             response_text = process_expense_message_with_trips(
                 message_body, 
                 from_number,
                 correlation_id
             )
         
-        # Log performance metrics
+        # Log performance
         duration = time.time() - request_start_time
         log_structured('INFO', 'Request completed', correlation_id, 
                       duration_ms=int(duration * 1000))
+        
+        return create_twiml_response(response_text, correlation_id)
             
-    except ValueError as e:
-        log_structured('WARN', 'Input validation error', correlation_id, error=str(e))
-        response_text = "Please check your input and try again."
     except Exception as e:
         error_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_structured('ERROR', 'Critical error', correlation_id, 
-                      error_id=error_id, error_type=type(e).__name__)
+                      error_id=error_id, error=str(e)[:200])
         response_text = f"Service temporarily unavailable (ID: {error_id})"
-    
-    return create_twiml_response(response_text, correlation_id)
+        return create_error_response(response_text, correlation_id)
 
 # =================== STATUS ENDPOINTS ===================
 
