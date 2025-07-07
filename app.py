@@ -18,9 +18,8 @@ import time
 import redis
 import json
 from cryptography.fernet import Fernet
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+from sendgrid import SendGridAPIClient
+from sendgrid.helpers.mail import Mail
 
 # Load environment variables
 load_dotenv()
@@ -173,6 +172,43 @@ def clear_pending_event(phone_number):
     except:
         pass
 
+def store_user_email(phone_number, email_address):
+    """Store user's Skylight email"""
+    redis_client = get_redis_client()
+    if not redis_client:
+        # Fallback to in-memory storage for MVP
+        return False
+    
+    try:
+        phone_hash = hash_phone_number(phone_number)
+        user_data = {
+            'skylight_email': email_address,
+            'setup_date': datetime.now().isoformat()
+        }
+        redis_client.setex(f"user:{phone_hash}:profile", 
+                          30 * 24 * 3600,  # 30 days
+                          json.dumps(user_data))
+        return True
+    except Exception as e:
+        log_structured('ERROR', 'Failed to store email', get_correlation_id(), error=str(e))
+        return False
+
+def get_user_skylight_email(phone_number):
+    """Get user's Skylight email"""
+    redis_client = get_redis_client()
+    if not redis_client:
+        # For MVP without Redis, use environment variable
+        return os.getenv('DEFAULT_SKYLIGHT_EMAIL')
+    
+    try:
+        phone_hash = hash_phone_number(phone_number)
+        user_data = redis_client.get(f"user:{phone_hash}:profile")
+        if user_data:
+            return json.loads(user_data).get('skylight_email')
+        return None
+    except:
+        return None
+
 # =================== LOGGING ===================
 
 def log_structured(level, message, correlation_id=None, **kwargs):
@@ -265,69 +301,116 @@ def handle_menu_choice(choice, correlation_id):
     """Updated menu for family context"""
     
     menu_responses = {
-        '1': "👨‍👩‍👧‍👦 **Let's Set Up Your Family!**\n\nTell me your children's names and ages. For example:\n'My kids are Emma (8) and Jack (6)'\n\nThis helps me track their activities accurately! 🎯",
+        '1': "👨‍👩‍👧‍👦 **Let's Set Up Your Family!**\n\nFirst, I need your Skylight calendar email address.\n\nReply with: setup email your-calendar@skylight.frame\n\nExample: setup email smith-family@skylight.frame",
         
         '2': "🎙️ **Voice Scheduling Magic!**\n\nJust send a voice message like:\n• 'Soccer practice moved to Thursday 4:30'\n• 'Dentist appointment for Jack Monday at 3'\n• 'Emma has piano recital next Saturday'\n\nI'll transcribe it and add to your calendar! ✨",
         
-        '3': "📱 **How S.V.E.N. Works:**\n\n1. Send voice message → I transcribe it\n2. I show you what I understood\n3. Confirm or edit the details\n4. Synced to your family calendar!\n\nNo more forgotten practices! 🏆",
+        '3': "📱 **How S.V.E.N. Works:**\n\n1. Set up your Skylight email (option 1)\n2. Send voice message → I transcribe it\n3. Confirm the details\n4. Auto-synced to your Skylight!\n\nNo more forgotten practices! 🏆",
         
-        '4': "🧪 **Test Voice Feature!**\n\nTry sending a voice message now:\n'Soccer practice moved to Thursday 4:30'\n\nI'll show you how I process it! 🎯",
+        '4': "🧪 **Test Voice Feature!**\n\nFirst, make sure you've set up your email (option 1)!\n\nThen send a voice message:\n'Soccer practice Thursday 4:30'\n\nI'll show you how I process it! 🎯",
         
-        '5': "💡 **S.V.E.N. Family Tips:**\n\n• Name which child: 'Emma's dance class'\n• Include times: 'Baseball 9am Saturday'\n• I'll detect conflicts automatically\n• Your data is always private & secure\n\nQuestions? Just ask! 💬"
+        '5': "💡 **S.V.E.N. Family Tips:**\n\n• Set up your email first (option 1)\n• Name which child in voice messages\n• Include times and days\n• I'll detect conflicts automatically\n\nQuestions? Just ask! 💬"
     }
     
     return menu_responses.get(choice, "Please choose 1, 2, 3, 4, or 5! 📋")
 
-# =================== SKYLIGHT INTEGRATION ===================
+# =================== SENDGRID EMAIL INTEGRATION ===================
 
-def send_to_skylight(event_data, phone_number, correlation_id):
-    """Send event to Skylight via email"""
+def send_to_skylight_sendgrid(event_data, phone_number, correlation_id, user_email=None):
+    """Send event to Skylight via SendGrid"""
     try:
-        # Get user's Skylight email (for MVP, use env var)
-        skylight_email = os.getenv('SKYLIGHT_EMAIL', 'your-calendar@skylight.frame')
+        # Get SendGrid API key
+        sg_api_key = os.getenv('SENDGRID_API_KEY')
+        if not sg_api_key:
+            log_structured('ERROR', 'SendGrid API key not configured', correlation_id)
+            return False
+        
+        # Get user's email or use default
+        if not user_email:
+            user_email = get_user_skylight_email(phone_number)
+        
+        if not user_email:
+            user_email = os.getenv('DEFAULT_SKYLIGHT_EMAIL')
+            
+        if not user_email:
+            log_structured('ERROR', 'No Skylight email configured', correlation_id)
+            return False
         
         # Format the event for Skylight
-        subject = f"F.A.M. Calendar Update: {event_data.get('activity', 'Event')}"
+        subject = f"Calendar Update: {event_data.get('activity', 'Event')}"
         
-        # Build email body
-        body = f"""Event: {event_data.get('activity', 'Family Event')}
+        # Build email body - Skylight compatible format
+        html_content = f"""
+        <html>
+        <body>
+            <h2>New Event Added</h2>
+            <p><strong>Event:</strong> {event_data.get('activity', 'Family Event')}</p>
+            <p><strong>Date:</strong> {event_data.get('day', 'Today')}</p>
+            <p><strong>Time:</strong> {event_data.get('time', 'TBD')}</p>
+        """
+        
+        if event_data.get('child'):
+            html_content += f"<p><strong>For:</strong> {event_data.get('child')}</p>"
+        
+        if event_data.get('location'):
+            html_content += f"<p><strong>Location:</strong> {event_data.get('location')}</p>"
+        
+        if event_data.get('recurring'):
+            html_content += f"<p><strong>Recurring:</strong> {event_data.get('recurring')}</p>"
+        
+        html_content += """
+            <hr>
+            <p><small>Added by S.V.E.N. Family Assistant via WhatsApp</small></p>
+        </body>
+        </html>
+        """
+        
+        # Plain text version
+        plain_content = f"""New Event Added
+
+Event: {event_data.get('activity', 'Family Event')}
 Date: {event_data.get('day', 'Today')}
 Time: {event_data.get('time', 'TBD')}"""
         
         if event_data.get('child'):
-            body += f"\nFor: {event_data.get('child')}"
+            plain_content += f"\nFor: {event_data.get('child')}"
         
         if event_data.get('location'):
-            body += f"\nLocation: {event_data.get('location')}"
+            plain_content += f"\nLocation: {event_data.get('location')}"
         
         if event_data.get('recurring'):
-            body += f"\nRecurring: {event_data.get('recurring')}"
+            plain_content += f"\nRecurring: {event_data.get('recurring')}"
         
-        body += "\n\nAdded by: F.A.M. via WhatsApp"
+        plain_content += "\n\nAdded by S.V.E.N. Family Assistant"
         
-        # Send email
-        msg = MIMEMultipart()
-        msg['From'] = os.getenv('SMTP_FROM', 'fam@yourdomain.com')
-        msg['To'] = skylight_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(body, 'plain'))
-        
-        # SMTP configuration (use Gmail or your provider)
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(
-            os.getenv('SMTP_USER'), 
-            os.getenv('SMTP_PASS')
+        # Create SendGrid message
+        message = Mail(
+            from_email=(os.getenv('SENDGRID_FROM_EMAIL', 'sven@family-assistant.com'), 
+                       'S.V.E.N. Family Assistant'),
+            to_emails=user_email,
+            subject=subject,
+            plain_text_content=plain_content,
+            html_content=html_content
         )
         
-        server.send_message(msg)
-        server.quit()
+        # Add custom headers for better deliverability
+        message.reply_to = 'noreply@family-assistant.com'
         
-        log_structured('INFO', 'Sent to Skylight', correlation_id, event=event_data)
-        return True
+        # Send via SendGrid
+        sg = SendGridAPIClient(sg_api_key)
+        response = sg.send(message)
+        
+        log_structured('INFO', 'SendGrid email sent', correlation_id, 
+                      status_code=response.status_code,
+                      to_email=user_email,
+                      event=event_data.get('activity'))
+        
+        return response.status_code in [200, 201, 202]
         
     except Exception as e:
-        log_structured('ERROR', 'Skylight send failed', correlation_id, error=str(e)[:200])
+        log_structured('ERROR', 'SendGrid send failed', correlation_id, 
+                      error=str(e)[:200], 
+                      error_type=type(e).__name__)
         return False
 
 # =================== MESSAGE PROCESSING ===================
@@ -335,18 +418,49 @@ Time: {event_data.get('time', 'TBD')}"""
 def process_expense_message_with_trips(message_body, phone_number, correlation_id):
     """Enhanced expense processing with trip intelligence"""
     
+    # Check for email setup command
+    if message_body.lower().startswith("setup email"):
+        parts = message_body.split()
+        if len(parts) >= 3:
+            email = ' '.join(parts[2:])  # Handle emails with spaces
+            if "@" in email and "." in email:
+                if store_user_email(phone_number, email):
+                    # Send test email to verify
+                    test_event = {
+                        'activity': 'S.V.E.N. Setup Test',
+                        'day': 'Today',
+                        'time': datetime.now().strftime('%I:%M %p'),
+                        'child': 'Setup verification'
+                    }
+                    if send_to_skylight_sendgrid(test_event, phone_number, correlation_id, email):
+                        return f"✅ Perfect! I've sent a test email to: {email}\n\nCheck your Skylight - you should see a test event!\n\nNow you can send voice messages about real events! 🎤"
+                    else:
+                        return f"✅ Email saved: {email}\n\n⚠️ I couldn't send a test email. I'll try again with your first real event!"
+                else:
+                    return f"✅ Email noted: {email}\n\nNow send a voice message about an event! 🎤"
+            else:
+                return "❌ That doesn't look like a valid email. Please try again:\nsetup email your-calendar@skylight.frame"
+        else:
+            return "❌ Please include your Skylight email:\nsetup email your-calendar@skylight.frame"
+    
     # Check for confirmation
     if message_body.lower().strip() == "yes":
         pending_event = get_pending_event(phone_number)
         if pending_event:
-            # Send to Skylight!
-            success = send_to_skylight(pending_event, phone_number, correlation_id)
+            # Use SendGrid to send!
+            success = send_to_skylight_sendgrid(pending_event, phone_number, correlation_id)
             if success:
-                # Clear pending event
                 clear_pending_event(phone_number)
-                return "✅ Event added to your Skylight calendar! You'll see it in ~30 seconds. 📺"
+                user_email = get_user_skylight_email(phone_number) or "your Skylight"
+                return f"✅ Event sent to {user_email}! You'll see it in ~30 seconds. 📺\n\n🎉 Your family scheduling just got easier!"
             else:
-                return "❌ Sorry, I couldn't add that to Skylight. Please try again!"
+                return ("❌ I couldn't send the email to Skylight.\n\n"
+                       "Please check:\n"
+                       "1. Your Skylight email is correct\n"
+                       "2. Check spam/junk folder\n\n"
+                       "Your event details:\n"
+                       f"📅 {pending_event.get('activity')} for {pending_event.get('child', 'your child')}\n"
+                       f"🕐 {pending_event.get('day')} at {pending_event.get('time')}")
         else:
             return "🤔 I don't have any pending events to confirm. Try sending a voice message!"
     
@@ -359,7 +473,7 @@ def process_expense_message_with_trips(message_body, phone_number, correlation_i
     
     # Check for family setup
     if "my kids are" in message_body.lower():
-        return "✅ Great! I'll help you manage your family's schedule. Send a voice message with an event to try it out! 🎤"
+        return "✅ Great! I'll help you manage your family's schedule. First, set up your email with 'setup email your-calendar@skylight.frame', then send voice messages! 🎤"
     
     # Check for hello/hi
     if message_body.lower().strip() in ["hi", "hello", "hey"]:
@@ -371,7 +485,7 @@ def process_expense_message_with_trips(message_body, phone_number, correlation_i
         return """I'm S.V.E.N., your Smart Virtual Event Navigator! 📅✨
 
 Choose what you'd like to do:
-1️⃣ Set up your family
+1️⃣ Set up your email for calendar
 2️⃣ Learn about voice features  
 3️⃣ How S.V.E.N. works
 4️⃣ Test voice message
@@ -617,74 +731,110 @@ def sms_webhook():
 
 @app.route('/', methods=['GET'])
 def home():
-    return "S.V.E.N. (Smart Virtual Event Navigator) is running! 🤖 Text +18775374013 to start!", 200
+   return "S.V.E.N. (Smart Virtual Event Navigator) is running! 🤖 Text +18775374013 to start!", 200
 
 @app.route('/ping', methods=['GET'])
 def ping():
-    """Simple keep-alive endpoint"""
-    return {'status': 'alive', 'timestamp': datetime.now().isoformat()}, 200
+   """Simple keep-alive endpoint"""
+   return {'status': 'alive', 'timestamp': datetime.now().isoformat()}, 200
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Comprehensive health check"""
-    health_data = {
-        'status': 'healthy',
-        'timestamp': datetime.now().isoformat(),
-        'environment_ok': env_ok,
-        'cache_size': len(response_cache),
-        'memory_usage': f"{len(str(response_cache)) / 1024:.1f}KB"
-    }
-    
-    # Test Redis connectivity
-    try:
-        redis_client = get_redis_client()
-        if redis_client:
-            health_data['redis_status'] = 'connected'
-        else:
-            health_data['redis_status'] = 'disconnected'
-    except:
-        health_data['redis_status'] = 'error'
-    
-    # Test OpenAI connectivity
-    try:
-        if not openai.api_key:
-            health_data['openai_status'] = 'no_key'
-        else:
-            health_data['openai_status'] = 'ready'
-    except:
-        health_data['openai_status'] = 'error'
-    
-    status_code = 200 if env_ok else 503
-    return health_data, status_code
+   """Comprehensive health check"""
+   health_data = {
+       'status': 'healthy',
+       'timestamp': datetime.now().isoformat(),
+       'environment_ok': env_ok,
+       'cache_size': len(response_cache),
+       'memory_usage': f"{len(str(response_cache)) / 1024:.1f}KB"
+   }
+   
+   # Test Redis connectivity
+   try:
+       redis_client = get_redis_client()
+       if redis_client:
+           health_data['redis_status'] = 'connected'
+       else:
+           health_data['redis_status'] = 'disconnected'
+   except:
+       health_data['redis_status'] = 'error'
+   
+   # Test OpenAI connectivity
+   try:
+       if not openai.api_key:
+           health_data['openai_status'] = 'no_key'
+       else:
+           health_data['openai_status'] = 'ready'
+   except:
+       health_data['openai_status'] = 'error'
+   
+   # Test SendGrid connectivity
+   try:
+       if os.getenv('SENDGRID_API_KEY'):
+           health_data['sendgrid_status'] = 'configured'
+       else:
+           health_data['sendgrid_status'] = 'not_configured'
+   except:
+       health_data['sendgrid_status'] = 'error'
+   
+   status_code = 200 if env_ok else 503
+   return health_data, status_code
 
 @app.route('/debug', methods=['GET'])
 def debug_info():
-    """Debug endpoint - RESTRICT IN PRODUCTION"""
-    if os.getenv('FLASK_ENV') != 'development':
-        return "Debug endpoint disabled in production", 404
-    
-    debug_data = {
-        'timestamp': datetime.now().isoformat(),
-        'environment_ok': env_ok,
-        'openai_key_present': bool(os.getenv('OPENAI_API_KEY')),
-        'twilio_sid_present': bool(os.getenv('TWILIO_ACCOUNT_SID')),
-        'redis_url_present': bool(os.getenv('REDIS_URL')),
-        'flask_app': 'S.V.E.N. v2.0 Family Assistant'
-    }
-    
-    # Test Redis connection in debug
-    try:
-        redis_client = get_redis_client()
-        if redis_client:
-            debug_data['redis_test'] = 'success'
-            debug_data['redis_info'] = redis_client.info('server')['redis_version']
-        else:
-            debug_data['redis_test'] = 'failed'
-    except Exception as e:
-        debug_data['redis_test'] = f'error: {str(e)[:50]}'
-    
-    return debug_data, 200
+   """Debug endpoint - RESTRICT IN PRODUCTION"""
+   if os.getenv('FLASK_ENV') != 'development':
+       return "Debug endpoint disabled in production", 404
+   
+   debug_data = {
+       'timestamp': datetime.now().isoformat(),
+       'environment_ok': env_ok,
+       'openai_key_present': bool(os.getenv('OPENAI_API_KEY')),
+       'twilio_sid_present': bool(os.getenv('TWILIO_ACCOUNT_SID')),
+       'redis_url_present': bool(os.getenv('REDIS_URL')),
+       'sendgrid_key_present': bool(os.getenv('SENDGRID_API_KEY')),
+       'flask_app': 'S.V.E.N. v2.0 Family Assistant with SendGrid'
+   }
+   
+   # Test Redis connection in debug
+   try:
+       redis_client = get_redis_client()
+       if redis_client:
+           debug_data['redis_test'] = 'success'
+           debug_data['redis_info'] = redis_client.info('server')['redis_version']
+       else:
+           debug_data['redis_test'] = 'failed'
+   except Exception as e:
+       debug_data['redis_test'] = f'error: {str(e)[:50]}'
+   
+   return debug_data, 200
+
+@app.route('/test-email', methods=['GET'])
+def test_email():
+   """Test email configuration - useful for debugging SendGrid"""
+   if os.getenv('FLASK_ENV') != 'development':
+       return "Test endpoint disabled in production", 404
+   
+   try:
+       test_event = {
+           'activity': 'Test Event from S.V.E.N.',
+           'child': 'Test Child',
+           'day': 'Today',
+           'time': datetime.now().strftime('%I:%M %p'),
+           'location': 'Test Location'
+       }
+       
+       test_email_address = os.getenv('DEFAULT_SKYLIGHT_EMAIL', 'test@example.com')
+       success = send_to_skylight_sendgrid(test_event, 'test-phone', 'test-correlation', test_email_address)
+       
+       if success:
+           return f"Email test successful! Check {test_email_address} for the test event.", 200
+       else:
+           return "Email test failed. Check logs for details.", 500
+           
+   except Exception as e:
+       return f"Email test error: {str(e)}", 500
 
 if __name__ == '__main__':
-    log_structured('INFO', "S.V.E.N. Family Assistant starting up")
-    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+   log_structured('INFO', "S.V.E.N. Family Assistant starting up with SendGrid")
+   app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
