@@ -319,8 +319,9 @@ def handle_menu_choice(choice, correlation_id):
 def send_to_skylight_sendgrid(event_data, phone_number, correlation_id, user_email=None):
     """Send event to Skylight via SendGrid"""
     try:
-        # Get SendGrid API key
-        sg_api_key = os.getenv('SENDGRID_API_KEY')
+        # Get SendGrid API key and ALWAYS strip whitespace
+        sg_api_key = os.getenv('SENDGRID_API_KEY', '').strip()
+        
         if not sg_api_key:
             log_structured('ERROR', 'SendGrid API key not configured', correlation_id)
             return False
@@ -330,11 +331,13 @@ def send_to_skylight_sendgrid(event_data, phone_number, correlation_id, user_ema
             user_email = get_user_skylight_email(phone_number)
         
         if not user_email:
-            user_email = os.getenv('DEFAULT_SKYLIGHT_EMAIL')
+            user_email = os.getenv('DEFAULT_SKYLIGHT_EMAIL', '').strip()  # Strip this too!
             
         if not user_email:
             log_structured('ERROR', 'No Skylight email configured', correlation_id)
             return False
+        
+        # Rest of the function stays the same...
         
         # Format the event for Skylight
         subject = f"Calendar Update: {event_data.get('activity', 'Event')}"
@@ -385,7 +388,7 @@ Time: {event_data.get('time', 'TBD')}"""
         
         # Create SendGrid message
         message = Mail(
-            from_email=(os.getenv('SENDGRID_FROM_EMAIL', 'sven@family-assistant.com'), 
+            from_email=(os.getenv('SENDGRID_FROM_EMAIL', 'sven@family-assistant.com').strip(), 
                        'S.V.E.N. Family Assistant'),
             to_emails=user_email,
             subject=subject,
@@ -397,7 +400,7 @@ Time: {event_data.get('time', 'TBD')}"""
         message.reply_to = 'noreply@family-assistant.com'
         
         # Send via SendGrid
-        sg = SendGridAPIClient(sg_api_key)
+        sg_api_key = os.getenv('SENDGRID_API_KEY', '').strip()
         response = sg.send(message)
         
         log_structured('INFO', 'SendGrid email sent', correlation_id, 
@@ -422,7 +425,7 @@ def process_expense_message_with_trips(message_body, phone_number, correlation_i
     if message_body.lower().startswith("setup email"):
         parts = message_body.split()
         if len(parts) >= 3:
-            email = ' '.join(parts[2:])  # Handle emails with spaces
+            email = ' '.join(parts[2:]).strip()  # Handle emails with spaces and strip whitespace
             if "@" in email and "." in email:
                 if store_user_email(phone_number, email):
                     # Send test email to verify
