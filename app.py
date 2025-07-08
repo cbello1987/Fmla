@@ -1,28 +1,25 @@
-from flask import Flask, request, abort
-from twilio.twiml.messaging_response import MessagingResponse
-from twilio.request_validator import RequestValidator
+
+from flask import Flask, request
+from dotenv import load_dotenv
 import openai
 import os
-from dotenv import load_dotenv
-import base64
-import requests
-from PIL import Image
-import io
-import traceback
-from datetime import datetime, timedelta
-import hashlib
-import hmac
-import uuid
-from functools import lru_cache, wraps
 import time
-import redis
+from datetime import datetime
+import requests
 import json
-from cryptography.fernet import Fernet
-from sendgrid import SendGridAPIClient
-from sendgrid.helpers.mail import Mail
+from twilio.twiml.messaging_response import MessagingResponse
+
+# Import helpers and services
+from utils.helpers import get_correlation_id, sanitize_input, sanitize_family_input, verify_webhook_signature
+from utils.logging import log_structured
+from services.redis_service import (
+    get_redis_client, hash_phone_number, delete_user_data, store_pending_event, get_pending_event, clear_pending_event, store_user_email, get_user_skylight_email, get_user_profile, store_user_name
+)
+from services.email_service import send_to_skylight_sendgrid
 
 # Load environment variables
 load_dotenv()
+
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB limit
@@ -37,201 +34,12 @@ request_start_time = None
 response_cache = {}
 CACHE_EXPIRY = 3600  # 1 hour
 
-def get_correlation_id():
-    """Generate unique request ID for tracing"""
-    return str(uuid.uuid4())[:8]
 
-def verify_webhook_signature(request):
-    """Verify Twilio webhook signature for security"""
-    if os.getenv('FLASK_ENV') == 'development':
-        return True  # Skip in dev
-    
-    validator = RequestValidator(os.getenv('TWILIO_AUTH_TOKEN'))
-    signature = request.headers.get('X-Twilio-Signature', '')
-    url = request.url
-    params = request.form.to_dict()
-    
-    if not validator.validate(url, params, signature):
-        print("WARNING: Invalid Twilio signature detected!")
-        return False
-    
-    return True
-
-def sanitize_family_input(text, max_length=500):
-    """Sanitize input for family data"""
-    if not text:
-        return ""
-    text = text.replace('<', '').replace('>', '')
-    return text.strip()[:max_length]
-
-# =================== REDIS INTEGRATION ===================
-
-def get_redis_client():
-    """Get Redis client with secure connection"""
-    try:
-        redis_url = os.environ.get('REDIS_URL')
-        if not redis_url:
-            return None
-        
-        client = redis.from_url(
-            redis_url,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_timeout=5,
-            retry_on_timeout=True,
-        )
-        
-        client.ping()
-        return client
-    except Exception as e:
-        log_structured('ERROR', 'Redis connection failed', get_correlation_id(), error=str(e)[:100])
-        return None
-
-def hash_phone_number(phone):
-    """Hash phone number for privacy"""
-    salt = os.getenv('PHONE_HASH_SALT', 'sven_family_salt_2025')
-    return hashlib.sha256((phone + salt).encode()).hexdigest()[:16]
-
-def encrypt_sensitive_data(data):
-    """Encrypt sensitive data like amounts and vendors"""
-    try:
-        key_string = os.getenv('ENCRYPTION_KEY', 'sven_encryption_key_32_chars___').encode()
-        key = base64.urlsafe_b64encode(key_string[:32].ljust(32, b'0'))
-        fernet = Fernet(key)
-        return fernet.encrypt(str(data).encode()).decode()
-    except:
-        return str(data)
-
-def decrypt_sensitive_data(encrypted_data):
-    """Decrypt sensitive data"""
-    try:
-        key_string = os.getenv('ENCRYPTION_KEY', 'sven_encryption_key_32_chars___').encode()
-        key = base64.urlsafe_b64encode(key_string[:32].ljust(32, b'0'))
-        fernet = Fernet(key)
-        return fernet.decrypt(encrypted_data.encode()).decode()
-    except:
-        return encrypted_data
-
-def delete_user_data(phone_number):
-    """Delete all user data - GDPR compliance"""
-    redis_client = get_redis_client()
-    if not redis_client:
-        return False
-    
-    try:
-        phone_hash = hash_phone_number(phone_number)
-        redis_client.delete(f"user:{phone_hash}:profile")
-        redis_client.delete(f"user:{phone_hash}:trips")
-        redis_client.delete(f"family:{phone_hash}:profile")
-        redis_client.delete(f"family:{phone_hash}:events")
-        redis_client.delete(f"pending:{phone_hash}")
-        return True
-    except Exception as e:
-        log_structured('ERROR', 'Delete user data failed', get_correlation_id(), error=str(e)[:100])
-        return False
-
-def store_pending_event(phone_number, event_data, correlation_id):
-    """Store event data temporarily for confirmation"""
-    redis_client = get_redis_client()
-    if not redis_client:
-        return
-    
-    try:
-        phone_hash = hash_phone_number(phone_number)
-        key = f"pending:{phone_hash}"
-        redis_client.setex(key, 300, json.dumps(event_data))  # 5 minute expiry
-        log_structured('INFO', 'Stored pending event', correlation_id)
-    except Exception as e:
-        log_structured('ERROR', 'Failed to store pending event', correlation_id, error=str(e))
-
-def get_pending_event(phone_number):
-    """Get pending event awaiting confirmation"""
-    redis_client = get_redis_client()
-    if not redis_client:
-        return None
-    
-    try:
-        phone_hash = hash_phone_number(phone_number)
-        key = f"pending:{phone_hash}"
-        data = redis_client.get(key)
-        return json.loads(data) if data else None
-    except Exception as e:
-        log_structured('ERROR', 'Failed to get pending event', get_correlation_id(), error=str(e))
-        return None
-
-def clear_pending_event(phone_number):
-    """Clear pending event after confirmation"""
-    redis_client = get_redis_client()
-    if not redis_client:
-        return
-    
-    try:
-        phone_hash = hash_phone_number(phone_number)
-        key = f"pending:{phone_hash}"
-        redis_client.delete(key)
-    except:
-        pass
-
-def store_user_email(phone_number, email_address):
-    """Store user's Skylight email"""
-    redis_client = get_redis_client()
-    if not redis_client:
-        # Fallback to in-memory storage for MVP
-        return False
-    
-    try:
-        phone_hash = hash_phone_number(phone_number)
-        user_data = {
-            'skylight_email': email_address,
-            'setup_date': datetime.now().isoformat()
-        }
-        redis_client.setex(f"user:{phone_hash}:profile", 
-                          30 * 24 * 3600,  # 30 days
-                          json.dumps(user_data))
-        return True
-    except Exception as e:
-        log_structured('ERROR', 'Failed to store email', get_correlation_id(), error=str(e))
-        return False
-
-def get_user_skylight_email(phone_number):
-    """Get user's Skylight email"""
-    redis_client = get_redis_client()
-    if not redis_client:
-        # For MVP without Redis, use environment variable
-        return os.getenv('DEFAULT_SKYLIGHT_EMAIL')
-    
-    try:
-        phone_hash = hash_phone_number(phone_number)
-        user_data = redis_client.get(f"user:{phone_hash}:profile")
-        if user_data:
-            return json.loads(user_data).get('skylight_email')
-        return None
-    except:
-        return None
+# Remove duplicate get_correlation_id, sanitize_family_input (now in utils/helpers)
+# Remove extract_name_from_message (move to utils/helpers if needed)
 
 # =================== LOGGING ===================
 
-def log_structured(level, message, correlation_id=None, **kwargs):
-    timestamp = datetime.now().isoformat()
-    log_data = {
-        'timestamp': timestamp,
-        'level': level,
-        'message': message,
-        'correlation_id': correlation_id,
-        **kwargs
-    }
-    if 'error' in log_data and len(str(log_data['error'])) > 200:
-        log_data['error'] = str(log_data['error'])[:200] + '...'
-    
-    print(f"{level} [{correlation_id}] {message} {log_data}")
-
-def sanitize_input(text, max_length=5000):
-    """Validate and sanitize user input"""
-    if not text:
-        return ""
-    if len(text) > max_length:
-        raise ValueError(f"Input too long: {len(text)} chars (max {max_length})")
-    return text.strip()[:max_length]
 
 # Environment check on startup
 def check_environment():
@@ -314,121 +122,23 @@ def handle_menu_choice(choice, correlation_id):
     
     return menu_responses.get(choice, "Please choose 1, 2, 3, 4, or 5! 📋")
 
-# =================== SENDGRID EMAIL INTEGRATION ===================
-
-def send_to_skylight_sendgrid(event_data, phone_number, correlation_id, user_email=None):
-    """Send event to Skylight via SendGrid"""
-    try:
-        # Get SendGrid API key and ALWAYS strip whitespace
-        sg_api_key = os.getenv('SENDGRID_API_KEY', '').strip()
-        
-        if not sg_api_key:
-            log_structured('ERROR', 'SendGrid API key not configured', correlation_id)
-            return False
-        
-        # Get user's email or use default
-        if not user_email:
-            user_email = get_user_skylight_email(phone_number)
-        
-        if not user_email:
-            user_email = os.getenv('DEFAULT_SKYLIGHT_EMAIL', '').strip()  # Strip this too!
-            
-        if not user_email:
-            log_structured('ERROR', 'No Skylight email configured', correlation_id)
-            return False
-        
-        # Rest of the function stays the same...
-        
-        # Format the event for Skylight
-        subject = f"Calendar Update: {event_data.get('activity', 'Event')}"
-        
-        # Build email body - Skylight compatible format
-        html_content = f"""
-        <html>
-        <body>
-            <h2>New Event Added</h2>
-            <p><strong>Event:</strong> {event_data.get('activity', 'Family Event')}</p>
-            <p><strong>Date:</strong> {event_data.get('day', 'Today')}</p>
-            <p><strong>Time:</strong> {event_data.get('time', 'TBD')}</p>
-        """
-        
-        if event_data.get('child'):
-            html_content += f"<p><strong>For:</strong> {event_data.get('child')}</p>"
-        
-        if event_data.get('location'):
-            html_content += f"<p><strong>Location:</strong> {event_data.get('location')}</p>"
-        
-        if event_data.get('recurring'):
-            html_content += f"<p><strong>Recurring:</strong> {event_data.get('recurring')}</p>"
-        
-        html_content += """
-            <hr>
-            <p><small>Added by S.V.E.N. Family Assistant via WhatsApp</small></p>
-        </body>
-        </html>
-        """
-        
-        # Plain text version
-        plain_content = f"""New Event Added
-
-Event: {event_data.get('activity', 'Family Event')}
-Date: {event_data.get('day', 'Today')}
-Time: {event_data.get('time', 'TBD')}"""
-        
-        if event_data.get('child'):
-            plain_content += f"\nFor: {event_data.get('child')}"
-        
-        if event_data.get('location'):
-            plain_content += f"\nLocation: {event_data.get('location')}"
-        
-        if event_data.get('recurring'):
-            plain_content += f"\nRecurring: {event_data.get('recurring')}"
-        
-        plain_content += "\n\nAdded by S.V.E.N. Family Assistant"
-        
-        # Create SendGrid message
-        message = Mail(
-            from_email=(os.getenv('SENDGRID_FROM_EMAIL', 'sven@family-assistant.com').strip(), 
-                       'S.V.E.N. Family Assistant'),
-            to_emails=user_email,
-            subject=subject,
-            plain_text_content=plain_content,
-            html_content=html_content
-        )
-        
-        # Add custom headers for better deliverability
-        message.reply_to = 'noreply@family-assistant.com'
-        
-        # Send via SendGrid
-        sg_api_key = os.getenv('SENDGRID_API_KEY', '').strip()
-        response = sg.send(message)
-        
-        log_structured('INFO', 'SendGrid email sent', correlation_id, 
-                      status_code=response.status_code,
-                      to_email=user_email,
-                      event=event_data.get('activity'))
-        
-        return response.status_code in [200, 201, 202]
-        
-    except Exception as e:
-        log_structured('ERROR', 'SendGrid send failed', correlation_id, 
-                      error=str(e)[:200], 
-                      error_type=type(e).__name__)
-        return False
 
 # =================== MESSAGE PROCESSING ===================
 
 def process_expense_message_with_trips(message_body, phone_number, correlation_id):
-    """Enhanced expense processing with trip intelligence"""
-    
+    """Enhanced expense processing with trip intelligence and improved UX"""
+    message_lower = message_body.lower().strip()
+    # Accept more confirmations
+    confirm_responses = ["yes", "ok", "👍", "confirm", "y"]
+    cancel_responses = ["no", "cancel", "edit", "n", "❌"]
+
     # Check for email setup command
-    if message_body.lower().startswith("setup email"):
+    if message_lower.startswith("setup email"):
         parts = message_body.split()
         if len(parts) >= 3:
-            email = ' '.join(parts[2:]).strip()  # Handle emails with spaces and strip whitespace
+            email = ' '.join(parts[2:]).strip()
             if "@" in email and "." in email:
                 if store_user_email(phone_number, email):
-                    # Send test email to verify
                     test_event = {
                         'activity': 'S.V.E.N. Setup Test',
                         'day': 'Today',
@@ -436,66 +146,59 @@ def process_expense_message_with_trips(message_body, phone_number, correlation_i
                         'child': 'Setup verification'
                     }
                     if send_to_skylight_sendgrid(test_event, phone_number, correlation_id, email):
-                        return f"✅ Perfect! I've sent a test email to: {email}\n\nCheck your Skylight - you should see a test event!\n\nNow you can send voice messages about real events! 🎤"
+                        return (f"✅ Perfect! I've sent a test email to: {email}\n\nCheck your Skylight - you should see a test event!\n\nNow you can send voice messages about real events! 🎤\n\n🔒 Your data is private. Type 'delete my data' anytime.")
                     else:
-                        return f"✅ Email saved: {email}\n\n⚠️ I couldn't send a test email. I'll try again with your first real event!"
+                        return (f"✅ Email saved: {email}\n\n⚠️ I couldn't send a test email. I'll try again with your first real event!\n\n🔒 Your data is private. Type 'delete my data' anytime.")
                 else:
                     return f"✅ Email noted: {email}\n\nNow send a voice message about an event! 🎤"
             else:
                 return "❌ That doesn't look like a valid email. Please try again:\nsetup email your-calendar@skylight.frame"
         else:
             return "❌ Please include your Skylight email:\nsetup email your-calendar@skylight.frame"
-    
-    # Check for confirmation
-    if message_body.lower().strip() == "yes":
+
+    # Accept more confirmation/cancellation responses
+    if message_lower in confirm_responses:
         pending_event = get_pending_event(phone_number)
         if pending_event:
-            # Use SendGrid to send!
             success = send_to_skylight_sendgrid(pending_event, phone_number, correlation_id)
             if success:
                 clear_pending_event(phone_number)
                 user_email = get_user_skylight_email(phone_number) or "your Skylight"
-                return f"✅ Event sent to {user_email}! You'll see it in ~30 seconds. 📺\n\n🎉 Your family scheduling just got easier!"
+                return (f"✅ Event sent to {user_email}! You'll see it in ~30 seconds. 📺\n\n🎉 Your family scheduling just got easier!\n\nWhat next?\n• Add another\n• Show my week\n• Help\n\n🔒 Your data is private. Type 'delete my data' anytime.")
             else:
                 return ("❌ I couldn't send the email to Skylight.\n\n"
-                       "Please check:\n"
-                       "1. Your Skylight email is correct\n"
-                       "2. Check spam/junk folder\n\n"
-                       "Your event details:\n"
-                       f"📅 {pending_event.get('activity')} for {pending_event.get('child', 'your child')}\n"
-                       f"🕐 {pending_event.get('day')} at {pending_event.get('time')}")
+                        "Please check:\n"
+                        "1. Your Skylight email is correct\n"
+                        "2. Check spam/junk folder\n\n"
+                        "Your event details:\n"
+                        f"📅 {pending_event.get('activity')} for {pending_event.get('child', 'your child')}\n"
+                        f"🕐 {pending_event.get('day')} at {pending_event.get('time')}\n\n"
+                        "🔒 Your data is private. Type 'delete my data' anytime.")
         else:
             return "🤔 I don't have any pending events to confirm. Try sending a voice message!"
-    
-    # Check for data deletion request
-    if "delete my data" in message_body.lower():
+    if message_lower in cancel_responses:
+        clear_pending_event(phone_number)
+        return "❌ Event cancelled. No changes made.\n\nYou can send a new voice message or type 'menu' for options."
+
+    # Data deletion
+    if "delete my data" in message_lower:
         if delete_user_data(phone_number):
             return "✅ All your data has been deleted from S.V.E.N. You can start fresh anytime!"
         else:
             return "❌ Unable to delete data right now. Please try again later."
-    
-    # Check for family setup
-    if "my kids are" in message_body.lower():
-        return "✅ Great! I'll help you manage your family's schedule. First, set up your email with 'setup email your-calendar@skylight.frame', then send voice messages! 🎤"
-    
-    # Check for hello/hi
-    if message_body.lower().strip() in ["hi", "hello", "hey"]:
-        return "👋 Hi! I'm S.V.E.N., your family scheduling assistant! I help manage kids' activities. Type 'menu' to get started!"
-    
-    # Menu command - exact match to avoid confusion
-    message_lower = message_body.lower().strip()
-    if message_lower == "menu" or message_lower == "help":
-        return """I'm S.V.E.N., your Smart Virtual Event Navigator! 📅✨
 
-Choose what you'd like to do:
-1️⃣ Set up your email for calendar
-2️⃣ Learn about voice features  
-3️⃣ How S.V.E.N. works
-4️⃣ Test voice message
-5️⃣ Ask a question
+    # Family setup
+    if "my kids are" in message_lower:
+        return ("✅ Great! I'll help you manage your family's schedule. First, set up your email with 'setup email your-calendar@skylight.frame', then send voice messages! 🎤\n\n🔒 Your data is private. Type 'delete my data' anytime.")
 
-Reply with 1, 2, 3, 4, or 5."""
-    
+    # Greetings
+    if message_lower in ["hi", "hello", "hey"]:
+        return ("👋 Hi! I'm S.V.E.N., your family scheduling assistant! I help manage kids' activities. Type 'menu' to get started!\n\n🔒 Your data is private. Type 'delete my data' anytime.")
+
+    # Menu/help
+    if message_lower in ["menu", "help"]:
+        return ("I'm S.V.E.N., your Smart Virtual Event Navigator! 📅✨\n\nChoose what you'd like to do:\n1️⃣ Set up your email for calendar\n2️⃣ Learn about voice features  \n3️⃣ How S.V.E.N. works\n4️⃣ Test voice message\n5️⃣ Ask a question\n\nReply with 1, 2, 3, 4, or 5.\n\n🔒 Your data is private. Type 'delete my data' anytime.")
+
     # For any other message, pass to the AI
     try:
         response = openai.chat.completions.create(
@@ -508,15 +211,13 @@ Reply with 1, 2, 3, 4, or 5."""
             temperature=0.5,
             timeout=12
         )
-        
-        return response.choices[0].message.content
-        
+        return response.choices[0].message.content + "\n\n🔒 Your data is private. Type 'delete my data' anytime."
     except Exception as e:
         log_structured('ERROR', 'OpenAI error', correlation_id, error=str(e)[:100])
-        return "Sorry, I couldn't process that. Please try again!"
+        return "Sorry, I couldn't process that. Please try again!\n\n🔒 Your data is private. Type 'delete my data' anytime."
 
 def process_voice_message(audio_url, phone_number, correlation_id):
-    """Process voice messages and convert to text for event extraction"""
+    """Process voice messages and convert to text for event extraction (improved UX)"""
     try:
         # Download the audio file with auth
         auth = (os.getenv('TWILIO_ACCOUNT_SID'), os.getenv('TWILIO_AUTH_TOKEN'))
@@ -524,7 +225,7 @@ def process_voice_message(audio_url, phone_number, correlation_id):
         
         if audio_response.status_code != 200:
             log_structured('ERROR', 'Audio download failed', correlation_id, status=audio_response.status_code)
-            return "Sorry, I couldn't access the voice message. Please try again! 🎤"
+            return "Sorry, I couldn't access the voice message. Please try again! 🎤\n\n🔒 Your data is private. Type 'delete my data' anytime."
 
         # Save audio temporarily
         temp_path = f"/tmp/audio_{correlation_id}.ogg"
@@ -561,7 +262,10 @@ def process_voice_message(audio_url, phone_number, correlation_id):
             if event_data.get('recurring'):
                 confirmation += f"• Recurring: {event_data.get('recurring')}\n"
             
-            confirmation += "\n✅ Reply 'yes' to add to calendar or tell me what to change!"
+            confirmation += ("\n✅ Reply 'yes', 'ok', or 👍 to add to calendar, "
+                             "or reply 'no', 'cancel', or 'edit' to discard or change.\n"
+                             "You can also type changes directly!\n\n"
+                             "🔒 Your data is private. Type 'delete my data' anytime.")
             
             # Store event data temporarily in Redis for confirmation
             store_pending_event(phone_number, event_data, correlation_id)
@@ -569,14 +273,15 @@ def process_voice_message(audio_url, phone_number, correlation_id):
             return confirmation
         else:
             return (f"🎤 I heard: \"{transcript.text}\"\n\n"
-                   "🤔 I couldn't understand the event details. Please try saying:\n"
-                   "• 'Soccer practice Thursday at 4:30'\n"
-                   "• 'Emma has piano Monday 3pm'\n"
-                   "• 'Dentist for Jack tomorrow at 2'")
-            
+                    "🤔 I couldn't understand the event details. Please try saying:\n"
+                    "• 'Soccer practice Thursday at 4:30'\n"
+                    "• 'Emma has piano Monday 3pm'\n"
+                    "• 'Dentist for Jack tomorrow at 2'\n\n"
+                    "Or type your event details.\n\n"
+                    "🔒 Your data is private. Type 'delete my data' anytime.")
     except Exception as e:
         log_structured('ERROR', 'Voice processing failed', correlation_id, error=str(e)[:200])
-        return "Sorry, I had trouble with that voice message. Please try again! 🎤"
+        return "Sorry, I had trouble with that voice message. Please try again! 🎤\n\n🔒 Your data is private. Type 'delete my data' anytime."
     finally:
         # Clean up temp file
         try:
@@ -838,6 +543,11 @@ def test_email():
    except Exception as e:
        return f"Email test error: {str(e)}", 500
 
+
+# Register blueprints (routes)
+from routes.sms import sms_bp
+app.register_blueprint(sms_bp)
+
 if __name__ == '__main__':
-   log_structured('INFO', "S.V.E.N. Family Assistant starting up with SendGrid")
-   app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    log_structured('INFO', "S.V.E.N. Family Assistant starting up with SendGrid")
+    app.run(debug=True, host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
