@@ -10,17 +10,17 @@ import time
 from datetime import datetime
 import openai
 
-# Import or define any other needed helpers from app.py
-from app import (
-    env_ok, handle_menu_choice, process_expense_message_with_trips, process_voice_message, create_twiml_response, create_error_response
-)
-
 sms_bp = Blueprint('sms', __name__)
 
 @sms_bp.route('/sms', methods=['POST'])
 def sms_webhook():
+    # Import the functions from app at runtime to avoid circular imports
+    from app import (
+        env_ok, handle_menu_choice, process_expense_message_with_trips, 
+        process_voice_message, create_twiml_response, create_error_response
+    )
+    
     correlation_id = get_correlation_id()
-    global request_start_time
     request_start_time = time.time()
     log_structured('INFO', 'SMS webhook triggered', correlation_id)
 

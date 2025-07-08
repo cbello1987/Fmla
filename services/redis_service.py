@@ -24,8 +24,12 @@ def get_redis_client():
         return None
 
 def hash_phone_number(phone):
+    # Normalize phone number: remove spaces, dashes, and leading +
+    normalized = str(phone).replace(' ', '').replace('-', '')
+    if normalized.startswith('+'):
+        normalized = normalized[1:]
     salt = os.getenv('PHONE_HASH_SALT', 'sven_family_salt_2025')
-    return hashlib.sha256((phone + salt).encode()).hexdigest()[:16]
+    return hashlib.sha256((normalized + salt).encode()).hexdigest()[:16]
 
 def delete_user_data(phone_number):
     redis_client = get_redis_client()

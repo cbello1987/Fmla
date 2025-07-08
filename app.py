@@ -1,4 +1,3 @@
-
 from flask import Flask, request
 from dotenv import load_dotenv
 import openai
@@ -34,9 +33,6 @@ request_start_time = None
 response_cache = {}
 CACHE_EXPIRY = 3600  # 1 hour
 
-
-# Remove duplicate get_correlation_id, sanitize_family_input (now in utils/helpers)
-# Remove extract_name_from_message (move to utils/helpers if needed)
 
 # =================== LOGGING ===================
 
@@ -363,77 +359,6 @@ def create_error_response(message, correlation_id):
     """Create standardized error response"""
     log_structured('WARN', 'Error response', correlation_id, message=message)
     return create_twiml_response(message, correlation_id)
-
-# =================== WEBHOOK HANDLERS ===================
-
-@app.route('/sms', methods=['POST'])
-def sms_webhook():
-    correlation_id = get_correlation_id()
-    global request_start_time
-    request_start_time = time.time()
-    
-    log_structured('INFO', 'SMS webhook triggered', correlation_id)
-    
-    try:
-        # Security: Verify webhook signature
-        if not verify_webhook_signature(request):
-            log_structured('WARN', 'Invalid webhook signature', correlation_id)
-            return 'Forbidden', 403
-        
-        # Extract and validate input
-        from_number = request.form.get('From', 'UNKNOWN')
-        message_body = sanitize_input(request.form.get('Body', ''))
-        num_media = int(request.form.get('NumMedia', 0))
-
-        log_structured('INFO', 'Processing message', correlation_id, 
-                      from_user=from_number[-4:], media_count=num_media)
-        
-        # Environment check
-        if not env_ok:
-            return create_error_response(
-                "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄",
-                correlation_id
-            )
-        
-        response_text = ""
-        
-        # Handle numbered menu responses
-        if message_body.strip() in ['1', '2', '3', '4', '5']:
-            response_text = handle_menu_choice(message_body.strip(), correlation_id)
-        
-        # Handle voice messages
-        elif num_media > 0 and request.form.get('MediaContentType0', '').startswith('audio/'):
-            response_text = process_voice_message(
-                request.form.get('MediaUrl0'),
-                from_number,
-                correlation_id
-            )
-        
-        # Handle images
-        elif num_media > 0:
-            response_text = "📸 Photo received! For voice scheduling, please send a voice message instead! 🎤"
-        
-        # Handle text messages
-        else:
-            response_text = process_expense_message_with_trips(
-                message_body, 
-                from_number,
-                correlation_id
-            )
-        
-        # Log performance
-        duration = time.time() - request_start_time
-        log_structured('INFO', 'Request completed', correlation_id, 
-                      duration_ms=int(duration * 1000))
-        
-        return create_twiml_response(response_text, correlation_id)
-            
-    except Exception as e:
-        error_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_structured('ERROR', 'Critical error', correlation_id, 
-                      error_id=error_id, error=str(e)[:200])
-        response_text = f"Service temporarily unavailable (ID: {error_id})"
-        return create_error_response(response_text, correlation_id)
 
 # =================== STATUS ENDPOINTS ===================
 

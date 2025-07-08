@@ -2,20 +2,27 @@ import os
 from sendgrid import SendGridAPIClient
 from sendgrid.helpers.mail import Mail
 from utils.logging import log_structured
+from services.redis_service import get_user_skylight_email  # Import this!
 
-def send_to_skylight_sendgrid(event_data, phone_number, correlation_id, user_email=None, get_user_skylight_email=None):
+def send_to_skylight_sendgrid(event_data, phone_number, correlation_id, user_email=None):
     try:
         sg_api_key = os.getenv('SENDGRID_API_KEY', '').strip()
         if not sg_api_key:
             log_structured('ERROR', 'SendGrid API key not configured', correlation_id)
             return False
-        if not user_email and get_user_skylight_email:
+        
+        # Get user email if not provided
+        if not user_email:
             user_email = get_user_skylight_email(phone_number)
+        
+        # Fall back to default if still no email
         if not user_email:
             user_email = os.getenv('DEFAULT_SKYLIGHT_EMAIL', '').strip()
+        
         if not user_email:
             log_structured('ERROR', 'No Skylight email configured', correlation_id)
             return False
+        
         subject = f"Calendar Update: {event_data.get('activity', 'Event')}"
         html_content = f"""
         <html>
@@ -37,6 +44,7 @@ def send_to_skylight_sendgrid(event_data, phone_number, correlation_id, user_ema
         </body>
         </html>
         """
+        
         plain_content = f"""New Event Added\n\nEvent: {event_data.get('activity', 'Family Event')}\nDate: {event_data.get('day', 'Today')}\nTime: {event_data.get('time', 'TBD')}"""
         if event_data.get('child'):
             plain_content += f"\nFor: {event_data.get('child')}"
@@ -45,6 +53,7 @@ def send_to_skylight_sendgrid(event_data, phone_number, correlation_id, user_ema
         if event_data.get('recurring'):
             plain_content += f"\nRecurring: {event_data.get('recurring')}"
         plain_content += "\n\nAdded by S.V.E.N. Family Assistant"
+        
         message = Mail(
             from_email=(os.getenv('SENDGRID_FROM_EMAIL', 'sven@family-assistant.com').strip(),
                         'S.V.E.N. Family Assistant'),
@@ -54,8 +63,10 @@ def send_to_skylight_sendgrid(event_data, phone_number, correlation_id, user_ema
             html_content=html_content
         )
         message.reply_to = 'noreply@family-assistant.com'
+        
         sg = SendGridAPIClient(api_key=sg_api_key)
         response = sg.send(message)
+        
         log_structured('INFO', 'SendGrid email sent', correlation_id,
                       status_code=response.status_code,
                       to_email=user_email,
