@@ -132,7 +132,11 @@ def process_expense_message_with_trips(message_body, phone_number, correlation_i
     if message_lower.startswith("setup email"):
         parts = message_body.split()
         if len(parts) >= 3:
+            # Join all parts after "setup email" and clean up
             email = ' '.join(parts[2:]).strip()
+            # Remove common trailing punctuation
+            email = email.rstrip('.').rstrip(',').strip()
+            
             if "@" in email and "." in email:
                 if store_user_email(phone_number, email):
                     test_event = {
