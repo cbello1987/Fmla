@@ -123,7 +123,36 @@ def handle_menu_choice(choice, correlation_id):
 
 def process_expense_message_with_trips(message_body, phone_number, correlation_id):
     """Enhanced expense processing with trip intelligence and improved UX"""
+    from utils.command_matcher import CommandMatcher
     message_lower = message_body.lower().strip()
+    matcher = CommandMatcher()
+    match_result = matcher.match(message_lower)
+    log_structured('DEBUG', 'Fuzzy command match', correlation_id, user_input=message_lower, match=match_result)
+
+    # Show correction message if typo detected
+    correction_msg = None
+    if match_result['correction'] and match_result['command'] and match_result['confidence'] < 1.0:
+        correction_msg = f"I think you meant '{match_result['command'].capitalize()}'!"
+
+    command = match_result['command']
+
+    # Route commands to appropriate handlers
+    if command == 'menu':
+        response = handle_menu_choice('menu', correlation_id)
+        if correction_msg:
+            response = correction_msg + '\n' + response
+        return response
+    elif command == 'help':
+        response = ("I'm S.V.E.N., your Smart Virtual Event Navigator! 📅✨\n\nChoose what you'd like to do:\n1️⃣ Set up your email for calendar\n2️⃣ Learn about voice features  \n3️⃣ How S.V.E.N. works\n4️⃣ Test voice message\n5️⃣ Ask a question\n\nReply with 1, 2, 3, 4, or 5.\n\n🔒 Your data is private. Type 'delete my data' anytime.")
+        if correction_msg:
+            response = correction_msg + '\n' + response
+        return response
+    elif command == 'settings':
+        response = ("⚙️ Settings: To update your email, reply with 'setup email your-calendar@skylight.frame'. To delete your data, type 'delete my data'.")
+        if correction_msg:
+            response = correction_msg + '\n' + response
+        return response
+
     # Accept more confirmations
     confirm_responses = ["yes", "ok", "👍", "confirm", "y"]
     cancel_responses = ["no", "cancel", "edit", "n", "❌"]
@@ -136,7 +165,6 @@ def process_expense_message_with_trips(message_body, phone_number, correlation_i
             email = ' '.join(parts[2:]).strip()
             # Remove common trailing punctuation
             email = email.rstrip('.').rstrip(',').strip()
-            
             if "@" in email and "." in email:
                 if store_user_email(phone_number, email):
                     test_event = {
@@ -194,10 +222,6 @@ def process_expense_message_with_trips(message_body, phone_number, correlation_i
     # Greetings
     if message_lower in ["hi", "hello", "hey"]:
         return ("👋 Hi! I'm S.V.E.N., your family scheduling assistant! I help manage kids' activities. Type 'menu' to get started!\n\n🔒 Your data is private. Type 'delete my data' anytime.")
-
-    # Menu/help
-    if message_lower in ["menu", "help"]:
-        return ("I'm S.V.E.N., your Smart Virtual Event Navigator! 📅✨\n\nChoose what you'd like to do:\n1️⃣ Set up your email for calendar\n2️⃣ Learn about voice features  \n3️⃣ How S.V.E.N. works\n4️⃣ Test voice message\n5️⃣ Ask a question\n\nReply with 1, 2, 3, 4, or 5.\n\n🔒 Your data is private. Type 'delete my data' anytime.")
 
     # For any other message, pass to the AI
     try:

@@ -19,7 +19,8 @@ def sms_webhook():
         env_ok, handle_menu_choice, process_expense_message_with_trips, 
         process_voice_message, create_twiml_response, create_error_response
     )
-    
+    from services.user_profile_manager import UserProfileManager
+
     correlation_id = get_correlation_id()
     request_start_time = time.time()
     log_structured('INFO', 'SMS webhook triggered', correlation_id)
@@ -35,8 +36,13 @@ def sms_webhook():
         message_body = sanitize_input(request.form.get('Body', ''))
         num_media = int(request.form.get('NumMedia', 0))
 
-        log_structured('INFO', 'Processing message', correlation_id,
-                      from_user=from_number[-4:], media_count=num_media)
+        # User profile management
+        profile_mgr = UserProfileManager()
+        user_profile = profile_mgr.get_user_profile(from_number)
+        is_new_user = user_profile is None
+
+        # Log user status
+        log_structured('INFO', 'User status', correlation_id, user_status='new' if is_new_user else 'returning', phone=from_number)
 
         # Environment check
         if not env_ok:
@@ -45,12 +51,43 @@ def sms_webhook():
                 correlation_id
             )
 
-        response_text = ""
+        # Onboarding flow for new users
+        if is_new_user:
+            # Create profile and send onboarding message
+            profile_mgr.create_user_profile(from_number)
+            onboarding_msg = (
+                "👋 Welcome to S.V.E.N.! I'm your family's planning assistant.\n\n"
+                "To get started, please set up your Skylight calendar email.\n"
+                "Reply with: setup email your-calendar@skylight.frame\n\n"
+                "Example: setup email smith-family@skylight.frame\n\n"
+                "You can also tell me about your kids: 'My kids are Emma (8) and Jack (6)'\n\n"
+                "Type 'menu' for more options!"
+            )
+            # Save last_seen and increment message count
+            profile_mgr.update_last_seen(from_number)
+            profile_mgr.increment_message_count(from_number)
+            return create_twiml_response(onboarding_msg, correlation_id)
 
+        # Returning user: personalized greeting or normal flow
+        profile_mgr.update_last_seen(from_number)
+        profile_mgr.increment_message_count(from_number)
+        message_count = user_profile.get('message_count', 0) + 1 if user_profile else 1
+        onboarding_complete = user_profile.get('onboarding_complete', False) if user_profile else False
+
+        # Personalized greeting for returning users who haven't completed onboarding
+        if not onboarding_complete:
+            greet_msg = (
+                f"👋 Welcome back! You have sent {message_count} messages.\n"
+                "Don't forget to set up your Skylight email if you haven't: setup email your-calendar@skylight.frame\n"
+                "Type 'menu' for more options."
+            )
+            return create_twiml_response(greet_msg, correlation_id)
+
+        # Otherwise, proceed with normal message handling
+        response_text = ""
         # Handle numbered menu responses
         if message_body.strip() in ['1', '2', '3', '4', '5']:
             response_text = handle_menu_choice(message_body.strip(), correlation_id)
-
         # Handle voice messages
         elif num_media > 0 and request.form.get('MediaContentType0', '').startswith('audio/'):
             response_text = process_voice_message(
@@ -58,11 +95,9 @@ def sms_webhook():
                 from_number,
                 correlation_id
             )
-
         # Handle images
         elif num_media > 0:
             response_text = "📸 Photo received! For voice scheduling, please send a voice message instead! 🎤"
-
         # Handle text messages
         else:
             response_text = process_expense_message_with_trips(
