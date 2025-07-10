@@ -7,6 +7,7 @@ from services.redis_service import (
 from services.email_service import send_to_skylight_sendgrid
 from services.message_processor import MessageProcessor
 from services.user_context_service import UserContextService
+from services.user_manager import UserManager
 from services.config import SVENConfig
 from utils.security import validate_phone, sanitize_message, add_security_headers
 from utils.rate_limiting import AntiAbuseLimiter
@@ -25,6 +26,7 @@ def sms_webhook():
     log_structured('INFO', 'SMS webhook triggered', correlation_id)
     message_processor = MessageProcessor()
     user_context_service = UserContextService()
+    user_mgr = UserManager()
 
     try:
         # Security: Verify webhook signature (always enforce in prod)
@@ -75,6 +77,7 @@ def sms_webhook():
                 correlation_id
             )
 
+
         # Handle new users with personalized onboarding
         if is_new_user or user_context_service.should_trigger_onboarding(user_context):
             try:
@@ -84,6 +87,15 @@ def sms_webhook():
             except Exception as e:
                 log_structured('ERROR', 'Onboarding flow failed', correlation_id, error=str(e))
                 return message_processor.create_twiml_response(SVENConfig.MSG_ONBOARD, correlation_id)
+
+        # Check if this is a name response during onboarding
+        if is_new_user and not user_context.get('profile', {}).get('name'):
+            extracted_name = user_mgr.extract_name(message_body)
+            if extracted_name:
+                user_mgr.set_name(from_number, extracted_name)
+                user_context_service.update_user_interaction(from_number, 'name_setup', correlation_id)
+                response_text = f"Nice to meet you, {extracted_name}! I help busy families manage schedules through voice messages.\n\nTo get started, set up your email with 'setup email your-calendar@skylight.frame'\n\nOr just tell me about a family event!"
+                return message_processor.create_twiml_response(response_text, correlation_id)
 
         # Returning user: update interaction tracking and provide context
         try:
