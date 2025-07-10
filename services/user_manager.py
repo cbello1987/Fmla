@@ -1,9 +1,11 @@
+
 import re
 from datetime import datetime
 from services.redis_service import (
     store_user_email, get_user_skylight_email, get_user_profile, store_user_name
 )
 from utils.logging import log_structured
+from services.config import SVENConfig
 
 class UserManager:
     """
@@ -31,7 +33,7 @@ class UserManager:
         redis_client = get_redis_client()
         if redis_client:
             phone_hash = hash_phone_number(phone)
-            redis_client.setex(f"user:{phone_hash}:profile", 30 * 24 * 3600, json.dumps(profile))
+            redis_client.setex(f"user:{phone_hash}:profile", SVENConfig.get_redis_ttl('profile'), json.dumps(profile))
         return profile
 
     def get_email(self, phone):
@@ -100,4 +102,4 @@ class UserManager:
         return members
 
     def validate_email(self, email):
-        return bool(re.match(r"^[\w\.-]+@[\w\.-]+\.\w+$", email))
+        return bool(SVENConfig.EMAIL_REGEX.match(email))

@@ -1,9 +1,11 @@
+
 import os
 import json
 import hashlib
 from datetime import datetime
 import redis
 from utils.logging import log_structured
+from services.config import SVENConfig
 
 _redis_client = None
 def get_redis_client():
@@ -59,7 +61,7 @@ def store_pending_event(phone_number, event_data, correlation_id=None):
     try:
         phone_hash = hash_phone_number(phone_number)
         key = f"pending:{phone_hash}"
-        redis_client.setex(key, 300, json.dumps(event_data))
+        redis_client.setex(key, SVENConfig.get_redis_ttl('event'), json.dumps(event_data))
         log_structured('INFO', 'Stored pending event', correlation_id, phone_hash=phone_hash)
     except Exception as e:
         log_structured('ERROR', 'Failed to store pending event', correlation_id, error=str(e))
@@ -103,7 +105,7 @@ def store_user_email(phone_number, email_address, correlation_id=None):
             profile = standard_user_profile(phone_hash)
         profile['email'] = email_address
         profile['metadata']['last_seen'] = datetime.now().isoformat()
-        redis_client.setex(f"sven:user:{phone_hash}:profile", 365 * 24 * 3600, json.dumps(profile))
+        redis_client.setex(f"sven:user:{phone_hash}:profile", SVENConfig.get_redis_ttl('profile'), json.dumps(profile))
         log_structured('INFO', 'Stored user email', correlation_id, phone_hash=phone_hash, email=email_address)
         return True
     except Exception as e:
@@ -174,7 +176,7 @@ def store_user_name(phone_number, name, correlation_id=None):
             profile = standard_user_profile(phone_hash)
         profile['name'] = name
         profile['metadata']['last_seen'] = datetime.now().isoformat()
-        redis_client.setex(f"sven:user:{phone_hash}:profile", 365 * 24 * 3600, json.dumps(profile))
+        redis_client.setex(f"sven:user:{phone_hash}:profile", SVENConfig.get_redis_ttl('profile'), json.dumps(profile))
         log_structured('INFO', 'Stored user name', correlation_id, phone_hash=phone_hash, name=name)
         return True
     except Exception as e:

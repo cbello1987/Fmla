@@ -1,3 +1,5 @@
+
+
 from flask import Blueprint, request
 from utils.helpers import get_correlation_id, sanitize_input, verify_webhook_signature
 from utils.logging import log_structured
@@ -6,6 +8,9 @@ from services.redis_service import (
 )
 from services.email_service import send_to_skylight_sendgrid
 from services.user_manager import UserManager
+from services.config import SVENConfig
+from utils.security import validate_phone, sanitize_message, add_security_headers
+from utils.rate_limiting import AntiAbuseLimiter
 import os
 import time
 from datetime import datetime
@@ -26,15 +31,28 @@ def sms_webhook():
     log_structured('INFO', 'SMS webhook triggered', correlation_id)
 
     try:
-        # Security: Verify webhook signature
+        # Security: Verify webhook signature (always enforce in prod)
         if not verify_webhook_signature(request):
             log_structured('WARN', 'Invalid webhook signature', correlation_id)
             return 'Forbidden', 403
 
         # Extract and validate input
         from_number = request.form.get('From', 'UNKNOWN')
-        message_body = sanitize_input(request.form.get('Body', ''))
+        message_body = request.form.get('Body', '')
         num_media = int(request.form.get('NumMedia', 0))
+
+        # Input validation and sanitization
+        if not validate_phone(from_number):
+            log_structured('WARN', 'Invalid phone format', correlation_id)
+            return 'Forbidden', 400
+        message_body = sanitize_message(message_body)
+
+        # Anti-abuse rate limiting
+        allowed, wait = AntiAbuseLimiter.allow(from_number, message_body)
+        if not allowed:
+            log_structured('WARN', 'Rate limit/abuse triggered', correlation_id, phone=from_number, wait_seconds=wait)
+            resp = create_error_response(f"Too many requests. Please wait {wait} seconds.", correlation_id)
+            return add_security_headers(resp)
 
         # User profile management
         user_mgr = UserManager()
@@ -52,7 +70,7 @@ def sms_webhook():
         if not env_ok:
             log_structured('WARN', 'Environment not ready', correlation_id)
             return create_error_response(
-                "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄",
+                SVENConfig.MSG_STARTUP,
                 correlation_id
             )
 
@@ -62,15 +80,7 @@ def sms_webhook():
                 user_mgr.update_profile(from_number, {'name': None, 'onboarding_complete': False, 'message_count': 1, 'last_seen': datetime.now().isoformat()})
             except Exception as e:
                 log_structured('ERROR', 'Failed to update new user profile', correlation_id, error=str(e))
-            onboarding_msg = (
-                "👋 Welcome to S.V.E.N.! I'm your family's planning assistant.\n\n"
-                "To get started, please set up your Skylight calendar email.\n"
-                "Reply with: setup email your-calendar@skylight.frame\n\n"
-                "Example: setup email smith-family@skylight.frame\n\n"
-                "You can also tell me about your kids: 'My kids are Emma (8) and Jack (6)'\n\n"
-                "Type 'menu' for more options!"
-            )
-            return create_twiml_response(onboarding_msg, correlation_id)
+            return create_twiml_response(SVENConfig.MSG_ONBOARD, correlation_id)
 
         # Returning user: update last seen and message count
         try:
@@ -108,15 +118,16 @@ def sms_webhook():
             try:
                 if user_mgr.validate_email(new_email):
                     user_mgr.set_email(from_number, new_email)
-                    response_text = f"Great! Your email {new_email} is now set up."
+                    response_text = SVENConfig.MSG_EMAIL_SET.format(email=new_email)
                 else:
-                    response_text = "That doesn't look like a valid email. Please try again."
+                    response_text = SVENConfig.MSG_EMAIL_INVALID
             except Exception as e:
                 log_structured('ERROR', 'Failed to set user email', correlation_id, error=str(e))
-                response_text = "Sorry, I couldn't update your email right now. Please try again later."
+                response_text = SVENConfig.MSG_ERROR_GENERIC
             return create_twiml_response(f"Hey {name}!\n{response_text}", correlation_id)
 
         # Menu/help/settings/voice/expense/other command routing
+
         response_text = ""
         try:
             if matched_command in ['menu', 'help', 'settings']:
@@ -146,9 +157,9 @@ def sms_webhook():
                     )
                 except Exception as e:
                     log_structured('ERROR', 'Voice message processing failed', correlation_id, error=str(e))
-                    response_text = f"Sorry {name}, I couldn't process your voice message. Please try again."
+                    response_text = SVENConfig.MSG_VOICE_ERROR.format(name=name)
             elif num_media > 0:
-                response_text = "📸 Photo received! For voice scheduling, please send a voice message instead! 🎤"
+                response_text = SVENConfig.MSG_PHOTO_RECEIVED
             else:
                 # Default: expense/trip or unknown command
                 try:
@@ -160,10 +171,10 @@ def sms_webhook():
                     response_text = f"Hey {name}! {result}"
                 except Exception as e:
                     log_structured('ERROR', 'Expense/trip processing failed', correlation_id, error=str(e))
-                    response_text = f"Sorry {name}, I couldn't process that right now. Please try again later."
+                    response_text = SVENConfig.MSG_EXPENSE_ERROR.format(name=name)
         except Exception as e:
             log_structured('ERROR', 'Command routing failed', correlation_id, error=str(e))
-            response_text = f"Sorry {name}, something went wrong. Please try again."
+            response_text = SVENConfig.MSG_ERROR_GENERIC
 
         # Add correction message if needed
         if correction_msg:
@@ -178,12 +189,14 @@ def sms_webhook():
                           duration_ms=int(duration * 1000),
                           user_name=name, email=email, children=children)
 
-        return create_twiml_response(response_text, correlation_id)
+        resp = create_twiml_response(response_text, correlation_id)
+        return add_security_headers(resp)
     except Exception as e:
         import traceback
         error_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         tb = traceback.format_exc(limit=3)
         log_structured('ERROR', 'Critical error', correlation_id,
                       error_id=error_id, error=str(e)[:200], traceback=tb)
-        response_text = f"Service temporarily unavailable (ID: {error_id})"
-        return create_error_response(response_text, correlation_id)
+        response_text = SVENConfig.MSG_SERVICE_UNAVAILABLE.format(error_id=error_id)
+        resp = create_error_response(response_text, correlation_id)
+        return add_security_headers(resp)
