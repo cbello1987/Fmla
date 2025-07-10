@@ -5,6 +5,7 @@ from services.redis_service import (
     get_pending_event, clear_pending_event, store_pending_event, delete_user_data, store_user_email, get_user_skylight_email, get_user_profile, store_user_name
 )
 from services.email_service import send_to_skylight_sendgrid
+from services.user_manager import UserManager
 import os
 import time
 from datetime import datetime
@@ -19,8 +20,7 @@ def sms_webhook():
         env_ok, handle_menu_choice, process_expense_message_with_trips, 
         process_voice_message, create_twiml_response, create_error_response
     )
-    from services.user_profile_manager import UserProfileManager
-
+    from utils.command_matcher import CommandMatcher
     correlation_id = get_correlation_id()
     request_start_time = time.time()
     log_structured('INFO', 'SMS webhook triggered', correlation_id)
@@ -37,15 +37,20 @@ def sms_webhook():
         num_media = int(request.form.get('NumMedia', 0))
 
         # User profile management
-        profile_mgr = UserProfileManager()
-        user_profile = profile_mgr.get_user_profile(from_number)
-        is_new_user = user_profile is None
+        user_mgr = UserManager()
+        try:
+            user_profile = user_mgr.get_profile(from_number)
+        except Exception as e:
+            log_structured('ERROR', 'Failed to load user profile', correlation_id, error=str(e))
+            user_profile = None
+        is_new_user = not user_profile or not user_profile.get('name')
 
         # Log user status
         log_structured('INFO', 'User status', correlation_id, user_status='new' if is_new_user else 'returning', phone=from_number)
 
         # Environment check
         if not env_ok:
+            log_structured('WARN', 'Environment not ready', correlation_id)
             return create_error_response(
                 "S.V.E.N. is starting up. Please try again in 30 seconds! 🔄",
                 correlation_id
@@ -53,8 +58,10 @@ def sms_webhook():
 
         # Onboarding flow for new users
         if is_new_user:
-            # Create profile and send onboarding message
-            profile_mgr.create_user_profile(from_number)
+            try:
+                user_mgr.update_profile(from_number, {'name': None, 'onboarding_complete': False, 'message_count': 1, 'last_seen': datetime.now().isoformat()})
+            except Exception as e:
+                log_structured('ERROR', 'Failed to update new user profile', correlation_id, error=str(e))
             onboarding_msg = (
                 "👋 Welcome to S.V.E.N.! I'm your family's planning assistant.\n\n"
                 "To get started, please set up your Skylight calendar email.\n"
@@ -63,58 +70,120 @@ def sms_webhook():
                 "You can also tell me about your kids: 'My kids are Emma (8) and Jack (6)'\n\n"
                 "Type 'menu' for more options!"
             )
-            # Save last_seen and increment message count
-            profile_mgr.update_last_seen(from_number)
-            profile_mgr.increment_message_count(from_number)
             return create_twiml_response(onboarding_msg, correlation_id)
 
-        # Returning user: personalized greeting or normal flow
-        profile_mgr.update_last_seen(from_number)
-        profile_mgr.increment_message_count(from_number)
-        message_count = user_profile.get('message_count', 0) + 1 if user_profile else 1
-        onboarding_complete = user_profile.get('onboarding_complete', False) if user_profile else False
+        # Returning user: update last seen and message count
+        try:
+            user_mgr.update_profile(from_number, {'last_seen': datetime.now().isoformat(), 'message_count': user_profile.get('metadata', {}).get('message_count', 0) + 1})
+        except Exception as e:
+            log_structured('ERROR', 'Failed to update returning user profile', correlation_id, error=str(e))
+        name = user_profile.get('name', 'there')
+        onboarding_complete = user_profile.get('metadata', {}).get('onboarding_complete', False)
+        children = user_profile.get('children', [])
+        email = user_profile.get('email')
 
-        # Personalized greeting for returning users who haven't completed onboarding
-        if not onboarding_complete:
-            greet_msg = (
-                f"👋 Welcome back! You have sent {message_count} messages.\n"
-                "Don't forget to set up your Skylight email if you haven't: setup email your-calendar@skylight.frame\n"
-                "Type 'menu' for more options."
-            )
-            return create_twiml_response(greet_msg, correlation_id)
+        # Fuzzy command matching
+        matcher = CommandMatcher()
+        try:
+            match_result = matcher.match(message_body)
+            matched_command = match_result.get('command')
+            corrections = match_result.get('corrections')
+        except Exception as e:
+            log_structured('ERROR', 'Fuzzy command matching failed', correlation_id, error=str(e))
+            matched_command = None
+            corrections = None
+        correction_msg = ''
+        if corrections:
+            correction_msg = f"I think you meant '{corrections[0].capitalize()}'!\n"
 
-        # Otherwise, proceed with normal message handling
+        # Email setup command
+        import re
+        try:
+            email_setup_match = re.match(r"setup email (.+@.+\..+)", message_body.strip(), re.IGNORECASE)
+        except Exception as e:
+            log_structured('ERROR', 'Regex error for email setup', correlation_id, error=str(e))
+            email_setup_match = None
+        if email_setup_match:
+            new_email = email_setup_match.group(1).strip()
+            try:
+                if user_mgr.validate_email(new_email):
+                    user_mgr.set_email(from_number, new_email)
+                    response_text = f"Great! Your email {new_email} is now set up."
+                else:
+                    response_text = "That doesn't look like a valid email. Please try again."
+            except Exception as e:
+                log_structured('ERROR', 'Failed to set user email', correlation_id, error=str(e))
+                response_text = "Sorry, I couldn't update your email right now. Please try again later."
+            return create_twiml_response(f"Hey {name}!\n{response_text}", correlation_id)
+
+        # Menu/help/settings/voice/expense/other command routing
         response_text = ""
-        # Handle numbered menu responses
-        if message_body.strip() in ['1', '2', '3', '4', '5']:
-            response_text = handle_menu_choice(message_body.strip(), correlation_id)
-        # Handle voice messages
-        elif num_media > 0 and request.form.get('MediaContentType0', '').startswith('audio/'):
-            response_text = process_voice_message(
-                request.form.get('MediaUrl0'),
-                from_number,
-                correlation_id
-            )
-        # Handle images
-        elif num_media > 0:
-            response_text = "📸 Photo received! For voice scheduling, please send a voice message instead! 🎤"
-        # Handle text messages
-        else:
-            response_text = process_expense_message_with_trips(
-                message_body,
-                from_number,
-                correlation_id
-            )
+        try:
+            if matched_command in ['menu', 'help', 'settings']:
+                if matched_command == 'menu':
+                    children_str = ', '.join([f"{c['name']} ({c.get('age','?')})" for c in children]) if children else 'None'
+                    response_text = (
+                        f"Hey {name}! Here's your menu:\n"
+                        f"- Email: {email or 'Not set'}\n"
+                        f"- Children: {children_str}\n"
+                        "- Type 'help' for assistance or 'settings' to update your info."
+                    )
+                elif matched_command == 'help':
+                    if email:
+                        response_text = f"Hey {name}! You can add events, update your family, or type 'menu' for options."
+                    else:
+                        response_text = f"Hey {name}! Set up your email with 'setup email your@skylight.frame' to get started."
+                elif matched_command == 'settings':
+                    response_text = f"Hey {name}! Settings coming soon."
+            elif message_body.strip() in ['1', '2', '3', '4', '5']:
+                response_text = handle_menu_choice(message_body.strip(), correlation_id)
+            elif num_media > 0 and request.form.get('MediaContentType0', '').startswith('audio/'):
+                try:
+                    response_text = process_voice_message(
+                        request.form.get('MediaUrl0'),
+                        from_number,
+                        correlation_id
+                    )
+                except Exception as e:
+                    log_structured('ERROR', 'Voice message processing failed', correlation_id, error=str(e))
+                    response_text = f"Sorry {name}, I couldn't process your voice message. Please try again."
+            elif num_media > 0:
+                response_text = "📸 Photo received! For voice scheduling, please send a voice message instead! 🎤"
+            else:
+                # Default: expense/trip or unknown command
+                try:
+                    result = process_expense_message_with_trips(
+                        message_body,
+                        from_number,
+                        correlation_id
+                    )
+                    response_text = f"Hey {name}! {result}"
+                except Exception as e:
+                    log_structured('ERROR', 'Expense/trip processing failed', correlation_id, error=str(e))
+                    response_text = f"Sorry {name}, I couldn't process that right now. Please try again later."
+        except Exception as e:
+            log_structured('ERROR', 'Command routing failed', correlation_id, error=str(e))
+            response_text = f"Sorry {name}, something went wrong. Please try again."
 
-        # Log performance
+        # Add correction message if needed
+        if correction_msg:
+            response_text = correction_msg + response_text
+
+        # Log performance and slow operations
         duration = time.time() - request_start_time
-        log_structured('INFO', 'Request completed', correlation_id,
-                      duration_ms=int(duration * 1000))
+        if duration > 2.0:
+            log_structured('WARN', 'Slow request', correlation_id, duration_ms=int(duration * 1000), user_name=name, email=email, children=children)
+        else:
+            log_structured('INFO', 'Request completed', correlation_id,
+                          duration_ms=int(duration * 1000),
+                          user_name=name, email=email, children=children)
 
         return create_twiml_response(response_text, correlation_id)
     except Exception as e:
+        import traceback
         error_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        tb = traceback.format_exc(limit=3)
         log_structured('ERROR', 'Critical error', correlation_id,
-                      error_id=error_id, error=str(e)[:200])
+                      error_id=error_id, error=str(e)[:200], traceback=tb)
         response_text = f"Service temporarily unavailable (ID: {error_id})"
         return create_error_response(response_text, correlation_id)

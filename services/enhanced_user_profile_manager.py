@@ -1,63 +1,6 @@
-import os
-import json
-import re
-from datetime import datetime, timedelta
-from typing import Optional
-from services.redis_service import get_redis_client, hash_phone_number
-from utils.logging import log_structured
-
-class EnhancedUserProfileManager:
-    def __init__(self, correlation_id=None):
-        self.redis_client = get_redis_client()
-        self.correlation_id = correlation_id
-        self.profile_ttl = 365 * 24 * 3600  # 1 year
-
-    def _profile_key(self, phone):
-        return f"user:{hash_phone_number(phone)}:profile"
-
-    def get_user_profile(self, phone):
-        try:
-            data = self.redis_client.get(self._profile_key(phone))
-            return json.loads(data) if data else {}
-        except Exception as e:
-            log_structured('ERROR', 'Failed to get user profile', self.correlation_id, error=str(e))
-            return {}
-
-    def save_user_profile(self, phone, profile):
-        try:
-            self.redis_client.setex(self._profile_key(phone), self.profile_ttl, json.dumps(profile))
-        except Exception as e:
-            log_structured('ERROR', 'Failed to save user profile', self.correlation_id, error=str(e))
-
-    def add_child_to_profile(self, phone, child_name, age=None):
-        profile = self.get_user_profile(phone)
-        if 'children' not in profile:
-            profile['children'] = []
-        child_entry = {'name': child_name}
-        if age:
-            child_entry['age'] = age
-        profile['children'].append(child_entry)
-        self.save_user_profile(phone, profile)
-        log_structured('INFO', 'Added child to profile', self.correlation_id, child=child_entry)
-
-    def extract_name_from_message(self, message) -> Optional[str]:
-        # Look for patterns like "I'm Carlos", "I am Carlos", "My name is Carlos"
-        patterns = [
-            r"i['’`]?m ([A-Za-zÀ-ÿ'\- ]+)",
-            r"i am ([A-Za-zÀ-ÿ'\- ]+)",
-            r"my name is ([A-Za-zÀ-ÿ'\- ]+)",
-            r"this is ([A-Za-zÀ-ÿ'\- ]+)",
-        ]
-        for pat in patterns:
-            match = re.search(pat, message, re.IGNORECASE)
-            if match:
-                name = match.group(1).strip().split()[0]
-                return name
-        return None
-
-    def mark_onboarding_complete(self, phone):
-        profile = self.get_user_profile(phone)
-        profile['onboarding_complete'] = True
+"""
+This file is deprecated. Please use services/user_manager.py for all user management.
+"""
         self.save_user_profile(phone, profile)
         log_structured('INFO', 'Onboarding marked complete', self.correlation_id, phone=phone)
 
