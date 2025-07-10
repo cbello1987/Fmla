@@ -138,7 +138,6 @@ def sms_webhook():
             try:
                 if user_context.get('profile', {}).get('email') != new_email:
                     # Only update if different
-                    from services.user_manager import UserManager
                     user_mgr = UserManager()
                     if user_mgr.validate_email(new_email):
                         user_mgr.set_email(from_number, new_email)
