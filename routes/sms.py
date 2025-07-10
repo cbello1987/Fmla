@@ -1,4 +1,4 @@
-from flask import Blueprint, request
+from flask import Blueprint, request, make_response
 from utils.helpers import get_correlation_id, sanitize_input, verify_webhook_signature
 from utils.logging import log_structured
 from services.redis_service import (
@@ -32,7 +32,8 @@ def sms_webhook():
         # Security: Verify webhook signature (always enforce in prod)
         if not verify_webhook_signature(request):
             log_structured('WARN', 'Invalid webhook signature', correlation_id)
-            return 'Forbidden', 403
+            resp = make_response('Forbidden', 403)
+            return add_security_headers(resp)
 
         # Extract and validate input
         from_number = request.form.get('From', 'UNKNOWN')
@@ -42,7 +43,8 @@ def sms_webhook():
         # Input validation and sanitization
         if not validate_phone(from_number):
             log_structured('WARN', 'Invalid phone format', correlation_id)
-            return 'Forbidden', 400
+            resp = make_response('Forbidden', 400)
+            return add_security_headers(resp)
         message_body = sanitize_message(message_body)
 
         # Anti-abuse rate limiting
@@ -72,10 +74,11 @@ def sms_webhook():
         env_ok = all(os.getenv(var) for var in required_vars)
         if not env_ok:
             log_structured('WARN', 'Environment not ready', correlation_id)
-            return message_processor.create_error_response(
+            resp = message_processor.create_error_response(
                 SVENConfig.MSG_STARTUP,
                 correlation_id
             )
+            return add_security_headers(resp)
 
 
         # Handle new users with personalized onboarding
@@ -86,7 +89,8 @@ def sms_webhook():
                 return message_processor.create_twiml_response(onboarding_message, correlation_id)
             except Exception as e:
                 log_structured('ERROR', 'Onboarding flow failed', correlation_id, error=str(e))
-                return message_processor.create_twiml_response(SVENConfig.MSG_ONBOARD, correlation_id)
+                resp = message_processor.create_twiml_response(SVENConfig.MSG_ONBOARD, correlation_id)
+                return add_security_headers(resp)
 
         # Check if this is a name response during onboarding  
         if is_new_user:
@@ -95,7 +99,8 @@ def sms_webhook():
                 user_mgr.set_name(from_number, extracted_name)
                 user_context_service.update_user_interaction(from_number, 'name_setup', correlation_id)
                 response_text = f"Nice to meet you, {extracted_name}! I help busy families manage schedules through voice messages.\n\nTo get started, set up your email with 'setup email your-calendar@skylight.frame'\n\nOr just tell me about a family event!"
-                return message_processor.create_twiml_response(response_text, correlation_id)
+                resp = message_processor.create_twiml_response(response_text, correlation_id)
+                return add_security_headers(resp)
 
         # Returning user: update interaction tracking and provide context
         try:
@@ -103,7 +108,8 @@ def sms_webhook():
             # Generate personalized greeting for returning users
             if message_body.lower().strip() in ['hi', 'hello', 'hey', 'menu']:
                 contextual_greeting = user_context_service.generate_contextual_greeting(from_number, user_context)
-                return message_processor.create_twiml_response(contextual_greeting, correlation_id)
+                resp = message_processor.create_twiml_response(contextual_greeting, correlation_id)
+                return add_security_headers(resp)
         except Exception as e:
             log_structured('ERROR', 'Failed to update user interaction', correlation_id, error=str(e))
 
@@ -149,7 +155,8 @@ def sms_webhook():
             except Exception as e:
                 log_structured('ERROR', 'Failed to set user email', correlation_id, error=str(e))
                 response_text = SVENConfig.MSG_ERROR_GENERIC
-            return message_processor.create_twiml_response(f"Hey {name}!\n{response_text}", correlation_id)
+            resp = message_processor.create_twiml_response(f"Hey {name}!\n{response_text}", correlation_id)
+            return add_security_headers(resp)
 
         # Menu/help/settings/voice/expense/other command routing
         response_text = ""
