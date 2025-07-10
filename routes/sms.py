@@ -88,8 +88,8 @@ def sms_webhook():
                 log_structured('ERROR', 'Onboarding flow failed', correlation_id, error=str(e))
                 return message_processor.create_twiml_response(SVENConfig.MSG_ONBOARD, correlation_id)
 
-        # Check if this is a name response during onboarding
-        if is_new_user and not user_context.get('profile', {}).get('name'):
+        # Check if this is a name response during onboarding  
+        if is_new_user:
             extracted_name = user_mgr.extract_name(message_body)
             if extracted_name:
                 user_mgr.set_name(from_number, extracted_name)
