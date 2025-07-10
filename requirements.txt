@@ -4,13 +4,8 @@ openai
 python-dotenv
 Pillow
 requests
-flask
-twilio
-openai
-python-dotenv
-pillow
-requests
 gunicorn
 redis==4.5.4
 cryptography
 sendgrid==6.10.0
+psutil
