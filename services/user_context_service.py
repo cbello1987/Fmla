@@ -1,3 +1,8 @@
+import json
+import os
+import hashlib
+from datetime import datetime
+from utils.logging import log_structured
 from datetime import datetime, timedelta
 from services.user_manager import UserManager
 from utils.logging import log_structured
@@ -7,57 +12,56 @@ class UserContextService:
         self.user_manager = UserManager()
 
     def get_user_context(self, phone_number, correlation_id=None):
-        """
-        Get user profile and determine interaction context
-        Returns: {
-            'is_new': bool,
-            'profile': dict,
-            'greeting_type': str,  # 'new_user', 'same_day', 'recent', 'long_absence'
-            'days_since_last_seen': int,
-            'name': str or None,
-            'last_event_summary': str or None
-        }
-        """
         try:
-            profile = self.user_manager.get_profile(phone_number)
+            phone_hash = self._hash_phone_number(phone_number)
+            profile_key = f"sven:user:{phone_hash}"
+            profile_data = self.redis_client.get(profile_key)
+            if profile_data:
+                profile = json.loads(profile_data)
+                user_name = profile.get('name')
+                if user_name:
+                    return {
+                        'is_new': False,
+                        'name': user_name,
+                        'profile': profile,
+                        'greeting_type': self._determine_greeting_type(profile)
+                    }
+            return {
+                'is_new': True,
+                'name': None,
+                'profile': {},
+                'greeting_type': 'new_user'
+            }
         except Exception as e:
-            log_structured('ERROR', 'Failed to load user profile', correlation_id, error=str(e))
-            profile = None
-        is_new = not profile or not profile.get('name')
-        name = profile.get('name') if profile else None
-        last_seen_str = None
-        days_since_last_seen = None
-        greeting_type = 'new_user'
-        last_event_summary = None
-        if not is_new and profile:
-            last_seen_str = profile.get('metadata', {}).get('last_seen')
-            if last_seen_str:
-                try:
-                    last_seen = datetime.fromisoformat(last_seen_str)
-                    now = datetime.now()
-                    days_since_last_seen = (now.date() - last_seen.date()).days
-                    if days_since_last_seen == 0:
-                        greeting_type = 'same_day'
-                    elif 1 <= days_since_last_seen <= 7:
-                        greeting_type = 'recent'
-                    else:
-                        greeting_type = 'long_absence'
-                except Exception as e:
-                    log_structured('ERROR', 'Corrupted last_seen in user profile', correlation_id, error=str(e))
-                    greeting_type = 'recent'
-                    days_since_last_seen = None
+            log_structured('ERROR', 'get_user_context failed', correlation_id, error=str(e))
+            return {
+                'is_new': True,
+                'name': None,
+                'profile': {},
+                'greeting_type': 'new_user'
+            }
+
+    def _hash_phone_number(self, phone_number):
+        clean_phone = phone_number.replace('whatsapp:', '').strip()
+        salt = os.getenv('PHONE_HASH_SALT', 'default_salt_2025')
+        return hashlib.sha256(f"{clean_phone}{salt}".encode()).hexdigest()
+
+    def _determine_greeting_type(self, profile):
+        last_seen = profile.get('last_seen') or profile.get('metadata', {}).get('last_seen')
+        if not last_seen:
+            return 'returning_user'
+        try:
+            last_dt = datetime.fromisoformat(last_seen.replace('Z', '+00:00'))
+            now = datetime.now().astimezone()
+            hours_since = (now - last_dt).total_seconds() / 3600
+            if hours_since < 24:
+                return 'same_day'
+            elif hours_since < 168:
+                return 'recent'
             else:
-                greeting_type = 'recent'
-            # Try to get last event summary
-            last_event_summary = profile.get('last_event_summary')
-        return {
-            'is_new': is_new,
-            'profile': profile,
-            'greeting_type': greeting_type,
-            'days_since_last_seen': days_since_last_seen,
-            'name': name,
-            'last_event_summary': last_event_summary
-        }
+                return 'long_absence'
+        except Exception:
+            return 'returning_user'
 
     def generate_contextual_greeting(self, phone_number, user_context):
         """
