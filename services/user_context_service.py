@@ -6,7 +6,7 @@ from utils.logging import log_structured
 from datetime import datetime, timedelta
 from services.user_manager import UserManager
 from utils.logging import log_structured
-from services.redis_service import get_redis_client
+from services.redis_service import get_redis_client, hash_phone_number
 
 class UserContextService:
     def __init__(self):
@@ -15,8 +15,8 @@ class UserContextService:
     def get_user_context(self, phone_number, correlation_id=None):
         try:
             redis_client = get_redis_client()
-            phone_hash = self._hash_phone_number(phone_number)
-            profile_key = f"sven:user:{phone_hash}"
+            phone_hash = hash_phone_number(phone_number)
+            profile_key = f"sven:user:{phone_hash}:profile"
             profile_data = redis_client.get(profile_key)
             if profile_data:
                 profile = json.loads(profile_data)
@@ -42,11 +42,6 @@ class UserContextService:
                 'profile': {},
                 'greeting_type': 'new_user'
             }
-
-    def _hash_phone_number(self, phone_number):
-        clean_phone = phone_number.replace('whatsapp:', '').strip()
-        salt = os.getenv('PHONE_HASH_SALT', 'default_salt_2025')
-        return hashlib.sha256(f"{clean_phone}{salt}".encode()).hexdigest()
 
     def _determine_greeting_type(self, profile):
         last_seen = profile.get('last_seen') or profile.get('metadata', {}).get('last_seen')
