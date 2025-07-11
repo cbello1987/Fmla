@@ -6,6 +6,7 @@ from utils.logging import log_structured
 from datetime import datetime, timedelta
 from services.user_manager import UserManager
 from utils.logging import log_structured
+from services.redis_service import get_redis_client
 
 class UserContextService:
     def __init__(self):
@@ -13,9 +14,10 @@ class UserContextService:
 
     def get_user_context(self, phone_number, correlation_id=None):
         try:
+            redis_client = get_redis_client()
             phone_hash = self._hash_phone_number(phone_number)
             profile_key = f"sven:user:{phone_hash}"
-            profile_data = self.redis_client.get(profile_key)
+            profile_data = redis_client.get(profile_key)
             if profile_data:
                 profile = json.loads(profile_data)
                 user_name = profile.get('name')
