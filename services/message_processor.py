@@ -1,17 +1,12 @@
 import openai
 import requests
 import json
+from flask import make_response
+from twilio.twiml.messaging_response import MessagingResponse
 from utils.logging import log_structured
 from services.config import SVENConfig
 from services.user_manager import UserManager
 from services.redis_service import get_user_profile
-# Add any other imports that were in app.py for these functions
-
-# If SVEN_FAMILY_PROMPT is defined in app.py, move it here or import from a constants module
-try:
-    from app import SVEN_FAMILY_PROMPT
-except ImportError:
-    SVEN_FAMILY_PROMPT = "S.V.E.N. Family Assistant Prompt"
 
 class MessageProcessor:
     def __init__(self):
@@ -33,14 +28,30 @@ class MessageProcessor:
         return f"Voice message processed for {phone_number}."
 
     def create_twiml_response(self, message, correlation_id):
-        # ...existing logic from app.py...
+        """Create proper Flask Response with TwiML content"""
+        # Create TwiML response
+        resp = MessagingResponse()
+        resp.message(message)
+        
+        # Create Flask response with proper headers
+        flask_response = make_response(str(resp))
+        flask_response.headers['Content-Type'] = 'application/xml'
+        
         log_structured('INFO', 'Twiml response created', correlation_id)
-        return f"<Response><Message>{message}</Message></Response>"
+        return flask_response
 
     def create_error_response(self, message, correlation_id):
-        # ...existing logic from app.py...
+        """Create proper Flask Response for errors"""
+        # Create TwiML response
+        resp = MessagingResponse()
+        resp.message(message)
+        
+        # Create Flask response with proper headers
+        flask_response = make_response(str(resp))
+        flask_response.headers['Content-Type'] = 'application/xml'
+        
         log_structured('ERROR', 'Error response created', correlation_id)
-        return f"<Response><Message>{message}</Message></Response>"
+        return flask_response
 
     def parse_event_from_voice(self, transcript, phone_number):
         # ...existing logic from app.py...
