@@ -205,13 +205,34 @@ def store_user_name(phone_number, name, correlation_id=None):
         return False
     try:
         phone_hash = hash_phone_number(phone_number)
+        key = f"sven:user:{phone_hash}:profile"
         profile = get_user_profile(phone_number, correlation_id)
         if not profile:
             profile = standard_user_profile(phone_hash)
         profile['name'] = name
         profile['metadata']['last_seen'] = datetime.now().isoformat()
-        redis_client.setex(f"sven:user:{phone_hash}:profile", SVENConfig.get_redis_ttl('profile'), json.dumps(profile))
-        log_structured('INFO', 'Stored user name', correlation_id, phone_hash=phone_hash, name=name)
+        serialized = None
+        try:
+            serialized = json.dumps(profile)
+        except Exception as ser_e:
+            log_structured('ERROR', 'JSON serialization failed in store_user_name', correlation_id, error=str(ser_e), profile=str(profile))
+            return False
+        log_structured('DEBUG', 'Saving user profile to Redis', correlation_id, key=key, profile=profile)
+        redis_client.setex(key, SVENConfig.get_redis_ttl('profile'), serialized)
+        log_structured('INFO', 'Stored user name', correlation_id, phone_hash=phone_hash, name=name, key=key)
+        # Immediately verify write
+        verify = redis_client.get(key)
+        if not verify:
+            log_structured('ERROR', 'Verification failed: profile not found after setex', correlation_id, key=key)
+            return False
+        try:
+            verify_profile = json.loads(verify)
+        except Exception as ver_e:
+            log_structured('ERROR', 'Verification JSON decode failed', correlation_id, error=str(ver_e), data=verify)
+            return False
+        if verify_profile.get('name') != name:
+            log_structured('ERROR', 'Verification failed: name mismatch after setex', correlation_id, expected=name, actual=verify_profile.get('name'))
+            return False
         return True
     except Exception as e:
         log_structured('ERROR', 'Failed to store user name', correlation_id, error=str(e))
