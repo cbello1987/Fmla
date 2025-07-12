@@ -18,7 +18,6 @@ from datetime import datetime
 sms_bp = Blueprint('sms', __name__)
 
 @sms_bp.route('/sms', methods=['POST'])
-
 def sms_webhook():
     from utils.command_matcher import CommandMatcher
     correlation_id = get_correlation_id()
@@ -80,26 +79,43 @@ def sms_webhook():
             )
             return add_security_headers(resp)
 
+        # *** CRITICAL FIX: Check for name input BEFORE onboarding redirect ***
+        user_profile = user_context.get('profile', {})
+        current_name = user_profile.get('name')
+        
+        # If user has no name and this might be a name, try to extract it
+        if not current_name:
+            extracted_name = user_mgr.extract_name(message_body)
+            log_structured('DEBUG', 'Name extraction attempt', correlation_id,
+                          message_body=message_body,
+                          extracted_name=extracted_name,
+                          current_name=current_name)
+            
+            if extracted_name:
+                # Store the name
+                result = user_mgr.set_name(from_number, extracted_name)
+                log_structured('INFO', 'Name stored', correlation_id,
+                              name=extracted_name, storage_result=result)
+                
+                # Update user context to reflect name was set
+                user_context_service.update_user_interaction(from_number, 'name_setup', correlation_id)
+                
+                # Progress to next onboarding step
+                response_text = f"Nice to meet you, {extracted_name}! I help busy families manage schedules through voice messages.\n\nTo get started, set up your email with 'setup email your-calendar@skylight.frame'\n\nOr just tell me about a family event!"
+                
+                resp = message_processor.create_twiml_response(response_text, correlation_id)
+                return add_security_headers(resp)
 
-        # Handle new users with personalized onboarding
-        if is_new_user or user_context_service.should_trigger_onboarding(user_context):
+        # Handle new users with personalized onboarding (only if no name was just extracted)
+        if is_new_user and not current_name:
             try:
                 onboarding_message = user_context_service.generate_contextual_greeting(from_number, user_context)
                 user_context_service.update_user_interaction(from_number, 'onboarding', correlation_id)
-                return message_processor.create_twiml_response(onboarding_message, correlation_id)
+                resp = message_processor.create_twiml_response(onboarding_message, correlation_id)
+                return add_security_headers(resp)
             except Exception as e:
                 log_structured('ERROR', 'Onboarding flow failed', correlation_id, error=str(e))
                 resp = message_processor.create_twiml_response(SVENConfig.MSG_ONBOARD, correlation_id)
-                return add_security_headers(resp)
-
-        # Check if this is a name response during onboarding  
-        if is_new_user:
-            extracted_name = user_mgr.extract_name(message_body)
-            if extracted_name:
-                user_mgr.set_name(from_number, extracted_name)
-                user_context_service.update_user_interaction(from_number, 'name_setup', correlation_id)
-                response_text = f"Nice to meet you, {extracted_name}! I help busy families manage schedules through voice messages.\n\nTo get started, set up your email with 'setup email your-calendar@skylight.frame'\n\nOr just tell me about a family event!"
-                resp = message_processor.create_twiml_response(response_text, correlation_id)
                 return add_security_headers(resp)
 
         # Returning user: update interaction tracking and provide context
