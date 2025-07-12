@@ -4,31 +4,65 @@ import json
 import hashlib
 from datetime import datetime
 import redis
+import time
+import threading
 from utils.logging import log_structured
 from services.config import SVENConfig
 
-_redis_client = None
-def get_redis_client():
-    global _redis_client
-    if _redis_client:
-        return _redis_client
-    try:
+
+# Redis connection pool and health monitoring
+_redis_pool = None
+_pool_lock = threading.Lock()
+_MAX_POOL_SIZE = 10
+_RETRY_ATTEMPTS = 3
+_RETRY_BASE_DELAY = 0.2  # seconds
+
+def _init_redis_pool():
+    global _redis_pool
+    with _pool_lock:
+        if _redis_pool is not None:
+            return _redis_pool
         redis_url = os.environ.get('REDIS_URL')
         if not redis_url:
             log_structured('ERROR', 'REDIS_URL not set', None)
             return None
-        _redis_client = redis.from_url(
-            redis_url,
-            decode_responses=True,
-            socket_connect_timeout=5,
-            socket_timeout=5,
-            retry_on_timeout=True,
-        )
-        _redis_client.ping()
-        return _redis_client
-    except Exception as e:
-        log_structured('ERROR', 'Redis connection failed', None, error=str(e)[:100])
+        try:
+            _redis_pool = redis.ConnectionPool.from_url(
+                redis_url,
+                max_connections=_MAX_POOL_SIZE,
+                decode_responses=True,
+                socket_connect_timeout=5,
+                socket_timeout=5,
+            )
+            # Test connection
+            client = redis.Redis(connection_pool=_redis_pool)
+            client.ping()
+            log_structured('INFO', 'Redis connection pool initialized', None)
+            return _redis_pool
+        except Exception as e:
+            log_structured('ERROR', 'Failed to initialize Redis pool', None, error=str(e)[:100])
+            _redis_pool = None
+            return None
+
+def get_redis_client():
+    pool = _init_redis_pool()
+    if not pool:
         return None
+    for attempt in range(_RETRY_ATTEMPTS):
+        try:
+            client = redis.Redis(connection_pool=pool)
+            # Health check
+            client.ping()
+            return client
+        except redis.ConnectionError as e:
+            delay = _RETRY_BASE_DELAY * (2 ** attempt)
+            log_structured('WARN', f'Redis connection failed, retrying in {delay:.2f}s', None, error=str(e))
+            time.sleep(delay)
+        except Exception as e:
+            log_structured('ERROR', 'Unexpected Redis error', None, error=str(e))
+            break
+    log_structured('ERROR', 'Redis pool exhausted or unavailable', None)
+    return None
 
 def hash_phone_number(phone):
     # Normalize phone number: remove spaces, dashes, and leading +
