@@ -7,9 +7,16 @@ class AntiAbuseLimiter:
     _fail_minute = defaultdict(lambda: deque(maxlen=5))
     _banned = defaultdict(float)  # phone -> ban expiry
     _identical_msgs = defaultdict(lambda: deque(maxlen=5))
+    # Development/test whitelist (bypass all rate limiting)
+    _whitelist = {
+        '+16178171635',  # Add more numbers as needed
+    }
 
     @classmethod
     def allow(cls, phone, message, success=True):
+        if phone in cls._whitelist:
+            log_structured('INFO', 'Rate limit bypass for whitelisted number', phone=phone)
+            return True, 0
         now = time.time()
         if now < cls._banned[phone]:
             return False, int(cls._banned[phone] - now)

@@ -139,14 +139,37 @@ def sms_webhook():
         try:
             match_result = matcher.match(message_body)
             matched_command = match_result.get('command')
+            confidence = match_result.get('confidence', None)
             corrections = match_result.get('corrections')
         except Exception as e:
             log_structured('ERROR', 'Fuzzy command matching failed', correlation_id, error=str(e))
             matched_command = None
+            confidence = None
             corrections = None
+        log_structured('DEBUG', 'Command matching result', correlation_id,
+                      input_message=message_body,
+                      match_result=str(match_result),
+                      matched_command=matched_command,
+                      confidence=confidence)
         correction_msg = ''
         if corrections:
             correction_msg = f"I think you meant '{corrections[0].capitalize()}'!\n"
+
+        # --- MENU COMMAND FIX ---
+        # Fallback: direct string match for 'menu' if fuzzy matching fails
+        menu_triggered = False
+        if (matched_command == 'menu') or (message_body.strip().lower() == 'menu'):
+            log_structured('DEBUG', 'Menu command recognized', correlation_id, user_name=user_name, email=email, children=children)
+            children_str = ', '.join([f"{c['name']} ({c.get('age','?')})" for c in children]) if children else 'None'
+            response_text = (
+                f"Hey {user_name}! Here's your menu:\n"
+                f"📧 Email: {email or 'Not set'}\n"
+                f"👨‍👩‍👧‍👦 Children: {children_str}\n"
+                f"⚙️ Settings: Type 'settings' to update\n"
+                f"❓ Help: Type 'help' for assistance"
+            )
+            menu_triggered = True
+            log_structured('DEBUG', 'Menu response generated', correlation_id, response_text=response_text)
 
         # Email setup command
         import re
@@ -171,84 +194,112 @@ def sms_webhook():
             except Exception as e:
                 log_structured('ERROR', 'Failed to set user email', correlation_id, error=str(e))
                 response_text = SVENConfig.MSG_ERROR_GENERIC
-            resp = message_processor.create_twiml_response(f"Hey {name}!\n{response_text}", correlation_id)
+            log_structured('DEBUG', 'Email setup response', correlation_id, response_text=response_text)
+            resp = message_processor.create_twiml_response(f"Hey {user_name}!\n{response_text}", correlation_id)
             return add_security_headers(resp)
 
-        # Menu/help/settings/voice/expense/other command routing
-        response_text = ""
+        # Unified command routing section
+        # 1. Special commands
+        if message_body.strip().lower() == "delete my data":
+            delete_user_data(from_number, correlation_id)
+            response_text = "✅ All your data has been deleted. Nice to meet you again!"
+            log_structured('DEBUG', 'Delete my data command processed', correlation_id, response_text=response_text)
+            resp = message_processor.create_twiml_response(response_text, correlation_id)
+            return add_security_headers(resp)
+
+        # 2. Email setup command
+        import re
         try:
-            if matched_command in ['menu', 'help', 'settings']:
-                if matched_command == 'menu':
-                    children_str = ', '.join([f"{c['name']} ({c.get('age','?')})" for c in children]) if children else 'None'
-                    response_text = (
-                        f"Here's your menu:\n"
-                        f"- Email: {email or 'Not set'}\n"
-                        f"- Children: {children_str}\n"
-                        "- Type 'help' for assistance or 'settings' to update your info."
-                    )
-                elif matched_command == 'help':
-                    if email:
-                        response_text = "You can add events, update your family, or type 'menu' for options."
-                    else:
-                        response_text = "Set up your email with 'setup email your@skylight.frame' to get started."
-                elif matched_command == 'settings':
-                    response_text = "Settings coming soon."
-            elif message_body.strip() in ['1', '2', '3', '4', '5']:
-                response_text = message_processor.handle_menu_choice(message_body.strip(), correlation_id)
-            elif num_media > 0 and request.form.get('MediaContentType0', '').startswith('audio/'):
-                try:
-                    response_text = message_processor.process_voice_message(
-                        request.form.get('MediaUrl0'),
-                        from_number,
-                        correlation_id
-                    )
-                except Exception as e:
-                    log_structured('ERROR', 'Voice message processing failed', correlation_id, error=str(e))
-                    response_text = SVENConfig.MSG_VOICE_ERROR.format(name=name)
-            elif num_media > 0:
-                response_text = SVENConfig.MSG_PHOTO_RECEIVED
-            else:
-                # Default: expense/trip or unknown command
-                try:
-                    result = message_processor.process_expense_message_with_trips(
-                        message_body,
-                        from_number,
-                        correlation_id
-                    )
-                    response_text = f"{result}"
-                except Exception as e:
-                    log_structured('ERROR', 'Expense/trip processing failed', correlation_id, error=str(e))
-                    response_text = SVENConfig.MSG_EXPENSE_ERROR.format(name=name)
+            email_setup_match = re.match(r"setup email (.+@.+\..+)", message_body.strip(), re.IGNORECASE)
         except Exception as e:
-            log_structured('ERROR', 'Command routing failed', correlation_id, error=str(e))
-            response_text = SVENConfig.MSG_ERROR_GENERIC
+            log_structured('ERROR', 'Regex error for email setup', correlation_id, error=str(e))
+            email_setup_match = None
+        if email_setup_match:
+            new_email = email_setup_match.group(1).strip()
+            try:
+                if user_context.get('profile', {}).get('email') != new_email:
+                    # Only update if different
+                    user_mgr = UserManager()
+                    if user_mgr.validate_email(new_email):
+                        user_mgr.set_email(from_number, new_email)
+                        response_text = SVENConfig.MSG_EMAIL_SET.format(email=new_email)
+                    else:
+                        response_text = SVENConfig.MSG_EMAIL_INVALID
+                else:
+                    response_text = SVENConfig.MSG_EMAIL_SET.format(email=new_email)
+            except Exception as e:
+                log_structured('ERROR', 'Failed to set user email', correlation_id, error=str(e))
+                response_text = SVENConfig.MSG_ERROR_GENERIC
+            log_structured('DEBUG', 'Email setup response', correlation_id, response_text=response_text)
+            resp = message_processor.create_twiml_response(f"Hey {user_name}!\n{response_text}", correlation_id)
+            return add_security_headers(resp)
 
-        # Add correction message if needed
-        if correction_msg:
-            response_text = correction_msg + response_text
+        # 3. Fuzzy matched commands
+        if (matched_command == 'menu') or (message_body.strip().lower() == 'menu'):
+            log_structured('DEBUG', 'Menu command recognized', correlation_id, user_name=user_name, email=email, children=children)
+            children_str = ', '.join([f"{c['name']} ({c.get('age','?')})" for c in children]) if children else 'None'
+            response_text = (
+                f"Hey {user_name}! Here's your menu:\n"
+                f"📧 Email: {email or 'Not set'}\n"
+                f"👨‍👩‍👧‍👦 Children: {children_str}\n"
+                f"⚙️ Settings: Type 'settings' to update\n"
+                f"❓ Help: Type 'help' for assistance"
+            )
+            log_structured('DEBUG', 'Menu response generated', correlation_id, response_text=response_text)
+            resp = message_processor.create_twiml_response(response_text, correlation_id)
+            return add_security_headers(resp)
+        if matched_command == 'help':
+            log_structured('DEBUG', 'Help command recognized', correlation_id)
+            if email:
+                response_text = "You can add events, update your family, or type 'menu' for options."
+            else:
+                response_text = "Set up your email with 'setup email your@skylight.frame' to get started."
+            resp = message_processor.create_twiml_response(f"Hey {user_name}!\n{response_text}", correlation_id)
+            return add_security_headers(resp)
+        if matched_command == 'settings':
+            log_structured('DEBUG', 'Settings command recognized', correlation_id)
+            response_text = "Settings coming soon."
+            resp = message_processor.create_twiml_response(f"Hey {user_name}!\n{response_text}", correlation_id)
+            return add_security_headers(resp)
 
-        # Add personalized prefix to responses
-        if user_name and user_name != 'there':
-            if not response_text.startswith(f"Hey {user_name}"):
-                response_text = f"Hey {user_name}! {response_text}"
+        # 4. Numbered choices
+        if message_body.strip() in ['1', '2', '3', '4', '5']:
+            log_structured('DEBUG', 'Menu choice branch', correlation_id, choice=message_body.strip())
+            response_text = message_processor.handle_menu_choice(message_body.strip(), correlation_id)
+            resp = message_processor.create_twiml_response(response_text, correlation_id)
+            return add_security_headers(resp)
 
-        # Log performance and slow operations
-        duration = time.time() - request_start_time
-        if duration > 2.0:
-            log_structured('WARN', 'Slow request', correlation_id, duration_ms=int(duration * 1000), user_name=name, email=email, children=children)
-        else:
-            log_structured('INFO', 'Request completed', correlation_id,
-                          duration_ms=int(duration * 1000),
-                          user_name=name, email=email, children=children)
+        # 5. Voice and photo
+        if num_media > 0 and request.form.get('MediaContentType0', '').startswith('audio/'):
+            log_structured('DEBUG', 'Voice message branch', correlation_id)
+            try:
+                response_text = message_processor.process_voice_message(
+                    request.form.get('MediaUrl0'),
+                    from_number,
+                    correlation_id
+                )
+            except Exception as e:
+                log_structured('ERROR', 'Voice message processing failed', correlation_id, error=str(e))
+                response_text = SVENConfig.MSG_VOICE_ERROR.format(name=name)
+            resp = message_processor.create_twiml_response(response_text, correlation_id)
+            return add_security_headers(resp)
+        if num_media > 0:
+            log_structured('DEBUG', 'Photo message branch', correlation_id)
+            response_text = SVENConfig.MSG_PHOTO_RECEIVED
+            resp = message_processor.create_twiml_response(response_text, correlation_id)
+            return add_security_headers(resp)
 
+        # 6. Expense/trip or unknown command (default)
+        try:
+            result = message_processor.process_expense_message_with_trips(
+                message_body,
+                from_number,
+                correlation_id
+            )
+            response_text = f"{result}"
+        except Exception as e:
+            log_structured('ERROR', 'Expense/trip processing failed', correlation_id, error=str(e))
+            response_text = SVENConfig.MSG_EXPENSE_ERROR.format(name=name)
         resp = message_processor.create_twiml_response(response_text, correlation_id)
         return add_security_headers(resp)
-    except Exception as e:
-        import traceback
-        error_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        tb = traceback.format_exc(limit=3)
-        log_structured('ERROR', 'Critical error', correlation_id,
-                      error_id=error_id, error=str(e)[:200], traceback=tb)
-        response_text = SVENConfig.MSG_SERVICE_UNAVAILABLE.format(error_id=error_id)
-        resp = message_processor.create_error_response(response_text, correlation_id)
-        return add_security_headers(resp)
+# ...existing code...
